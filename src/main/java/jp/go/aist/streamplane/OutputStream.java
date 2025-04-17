@@ -3,21 +3,22 @@ package jp.go.aist.streamplane;
 import org.apache.flink.api.common.functions.Partitioner;
 
 import java.io.Serializable;
+import java.util.UUID;
 
-public class DestinationTask implements Serializable {
+public class OutputStream implements Serializable {
 
-    private String taskName;
+    private String id;
     private Integer parallelism;
     private Partitioner partitioner;
 
-    DestinationTask(String taskName, Integer parallelism, Partitioner partitioner){
-        this.taskName = taskName;
+    OutputStream(Integer parallelism, Partitioner partitioner){
+        this.id = UUID.randomUUID().toString();
         this.parallelism = parallelism;
         this.partitioner = partitioner;
     }
 
-    public String getTaskName() {
-        return taskName;
+    public String getId() {
+        return id;
     }
 
     public Integer getParallelism() {

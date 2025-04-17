@@ -47,7 +47,7 @@ import java.util.Properties;
  * <p>If you change the name of the main class (with the public static void main(String[] args))
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
-public class WordCountHybrid {
+public class WordCountHybrid_2 {
 
 	public static void main(String[] args) throws Exception {
 
@@ -100,8 +100,8 @@ public class WordCountHybrid {
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
 				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+//testing: instance-status
 /*
-				//testing: instance-status
 				try {
 					Thread.sleep(5000);
 				} catch (InterruptedException e) {
@@ -121,6 +121,7 @@ public class WordCountHybrid {
 
 				tokenizerOperatorCache.put("instance-status-0", "Running"); //<instance_index>,<status>
 				tokenizerOperatorCache.put("instance-status-1", "Running"); //<instance_index>,<status>
+*/
 
 				try {
 					Thread.sleep(5000);
@@ -128,37 +129,46 @@ public class WordCountHybrid {
 					throw new RuntimeException(e);
 				}
 
-				// Switch channels from raw to imdg
-				IgniteCache<String, String> sourceOutputMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
-				sourceOutputMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
-				sourceOutputMetaCache.putIfAbsent("1", sourceOutput.getId() + "-1");
+				// Switch all channels from raw to imdg
+//				IgniteCache<String, String> tokenizerChannelMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
+//				tokenizerChannelMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
+//				tokenizerChannelMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
 
-				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-				tokenizerOutputMetaCache.putIfAbsent("0", tokenizerOutput.getId() + "-0");
-				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
 
-				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-				counterOutputMetaCache.putIfAbsent("0", counterOutput.getId() + "-0");
+//				IgniteCache<String, String> counterChannelMetaCache = ignite.getOrCreateCache(jobId + "-Counter-OUT");
+//				counterChannelMetaCache.putIfAbsent("0", jobId + "-Counter-OUT-0"); //<channel_index>,<queue_key>
+//				counterChannelMetaCache.putIfAbsent("1", jobId + "-Counter-OUT-1"); //<channel_index>,<queue_key>
 
-                try {
-                    Thread.sleep(10000);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
+				IgniteCache<String, String> sinkChannelMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+				sinkChannelMetaCache.putIfAbsent("0", counterOutput.getId() + "-0"); //<channel_index>,<queue_key>
+//				sinkChannelMetaCache.putIfAbsent("1", jobId + "-Sink: Sink-OUT-1"); //<channel_index>,<queue_key>
 
-                // Switch back channels from imdg to raw
-				sourceOutputMetaCache.remove("0");
-				sourceOutputMetaCache.remove("1");
+//                try {
+//                    Thread.sleep(5000);
+//                } catch (InterruptedException e) {
+//                    throw new RuntimeException(e);
+//                }
+//				System.out.println("#### 4");
+//                // Switch back all channels from imdg to raw
+//				tokenizerChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
+//				tokenizerChannelMetaCache.remove("1"); //<channel_index>,<queue_key>
+//
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
+//				System.out.println("#### 5");
+//				counterChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
+//				counterChannelMetaCache.remove("1"); //<channel_index>,<queue_key>
+//
+				try {
+					Thread.sleep(5000);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
 
-				tokenizerOutputMetaCache.remove("0");
-				tokenizerOutputMetaCache.remove("1");
-
-				counterOutputMetaCache.remove("0");
- */
-
-				//testing: migrating operator instance
-				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+				sinkChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
 			}
 
 			@Override

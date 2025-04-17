@@ -16,38 +16,47 @@ import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer, String>> {
 
+    private String defaultInputStreamId;
     private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> inputQueues;
 
     private final Map<String, String> operatorMeta;
-    private final Map<String, Map<String, String>> channelMetas;
 
     private Ignite ignite;
 
-    private String cachePrefix;
-
-    private CollectionConfiguration queueCfg;
-
-//    private volatile long prevTimestamp = 0;
-
-    public SinkFunctionHybrid(){
+    public SinkFunctionHybrid(String defaultInputStreamId){
+        this.defaultInputStreamId = defaultInputStreamId;
         this.inputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
-        this.channelMetas = new ConcurrentHashMap<>();
-        this.queueCfg = new CollectionConfiguration();
-        this.queueCfg.setCollocated(true);
     }
 
     @Override
     public void open(OpenContext openContext) throws Exception {
-        cachePrefix = getRuntimeContext().getJobInfo().getJobId().toString();
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
-        createContinousQuery(cachePrefix + "-" + this.getRuntimeContext().getTaskInfo().getTaskName(), operatorMeta); //cache_id: <job_id>-<this_task>
+        String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
+
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+        if(instanceStatus != null && instanceStatus.equals("Paused")){
+            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Paused");
+        } else {
+            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+        }
+
+        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream", this.defaultInputStreamId);
+        if(inputStream == null){
+            inputStream = this.defaultInputStreamId;
+        }
+        operatorMeta.put("input-stream", inputStream);
+
+        createContinousQuery(operatorMetaCacheKey, operatorMeta); //cache_id: <job_id>-task-<this_task_name>
     }
 
     private void createContinousQuery(String cacheKey, final Map<String, String> entries){
@@ -61,6 +70,11 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
                             if(e.getEventType() == EventType.REMOVED) {
                                 entries.remove(e.getKey());
                             } else {
+                                if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) && e.getValue().equals("Running")){
+                                    synchronized (operatorMeta) {
+                                        operatorMeta.notifyAll();
+                                    }
+                                }
                                 entries.put(e.getKey(), e.getValue());
                             }
                         }
@@ -84,26 +98,33 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
                 throw new Exception("Channel index of received tuples does not match this subtask");
             }
 
-//            System.out.println(channelType + " | tp: " + (System.nanoTime()-prevTimestamp));
-//            prevTimestamp = System.nanoTime();
-
             System.out.println(channelType + " | " + word);
 
-            String inputQueueKey = cachePrefix + "-" + this.getRuntimeContext().getTaskInfo().getTaskName() + "-OUT-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+            if(operatorMeta.getOrDefault("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running").equals("Paused")){
+                synchronized (operatorMeta) {
+                    operatorMeta.wait();
+                }
+            }
+
+            //get next tuple
+            String inputStreamKey = operatorMeta.getOrDefault("input-stream", this.defaultInputStreamId);
+            String inputQueueKey = inputStreamKey + "-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             if (channelType == 1) { // imdg
-                IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.computeIfAbsent(inputQueueKey, k -> ignite.queue(inputQueueKey, 0, queueCfg));
+                IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.computeIfAbsent(inputQueueKey, k -> ignite.queue(inputQueueKey, 0, ImdgConfig.QUEUE_CONFIG()));
                 Tuple3<Integer, Integer, String> tuple = queue.take();
                 channelIndex = tuple.f0;
                 channelType = tuple.f1;
                 word = tuple.f2;
+                continue;
             } else {
                 if(inputQueues.containsKey(inputQueueKey)) {
                     IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.get(inputQueueKey);
-                    if (!queue.isEmpty()) {
+                    if (!queue.isEmpty()) { //process inputs in IMDG if exists
                         Tuple3<Integer, Integer, String> tuple = queue.take();
                         channelIndex = tuple.f0;
                         channelType = tuple.f1;
                         word = tuple.f2;
+                        continue;
                     } else {
                         inputQueues.remove(inputQueueKey).close();
                     }
