@@ -63,6 +63,7 @@ public class WordCountHybrid {
 		final ParameterTool params = ParameterTool.fromArgs(args);
 		final String topic = params.get("topic", "t9");
 		final int p = params.getInt("p", env.getParallelism());
+		final boolean pausedJob = params.getBoolean("paused", false);
 
 		Properties producerProps = new Properties();
 		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
@@ -70,7 +71,7 @@ public class WordCountHybrid {
 		OutputStream sourceOutput = new OutputStream(p, new CustomRebalancePartitioner());
 
 		DataStream<Tuple3<Integer, Integer, String>> source = env
-				.addSource(new SourceGeneratorFunctionHybrid(sourceOutput))
+				.addSource(new SourceGeneratorFunctionHybrid(pausedJob, sourceOutput))
 				.setParallelism(1);
 
 		OutputStream tokenizerOutput = new OutputStream(p, new CustomHashPartitioner());
@@ -81,7 +82,7 @@ public class WordCountHybrid {
 				.name("Tokenizer")
 				.setParallelism(p);
 
-		OutputStream counterOutput = new OutputStream(1, new CustomHashPartitioner());
+		OutputStream counterOutput = new OutputStream(p, new CustomForwardPartitioner());
 
 		DataStream<Tuple3<Integer, Integer, String>> counter = tokenizer
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
@@ -93,72 +94,102 @@ public class WordCountHybrid {
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
 				.addSink(new SinkFunctionHybrid(counterOutput.getId()))
 				.name("Sink")
-				.setParallelism(1);
+				.setParallelism(p);
 
 		env.registerJobListener(new JobListener() {
 			@Override
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
+				System.out.println("Job id 1: " + jobId);
 				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
-/*
+
 				//testing: instance-status
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
-
-
-				IgniteCache<String, String> tokenizerOperatorCache = ignite.getOrCreateCache(jobId + "-task-Tokenizer");
-				tokenizerOperatorCache.put("instance-status-0", "Paused"); //<instance_index>,<status>
-				tokenizerOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
-
-				try {
-					Thread.sleep(10000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
-
-				tokenizerOperatorCache.put("instance-status-0", "Running"); //<instance_index>,<status>
-				tokenizerOperatorCache.put("instance-status-1", "Running"); //<instance_index>,<status>
-
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
+//
+//
+//				IgniteCache<String, String> tokenizerOperatorCache = ignite.getOrCreateCache(jobId + "-task-Tokenizer");
+//				tokenizerOperatorCache.put("instance-status-0", "Paused"); //<instance_index>,<status>
+//				tokenizerOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+//
+//				try {
+//					Thread.sleep(10000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
+//
+//				tokenizerOperatorCache.put("instance-status-0", "Running"); //<instance_index>,<status>
+//				tokenizerOperatorCache.put("instance-status-1", "Running"); //<instance_index>,<status>
+//
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
 
 				// Switch channels from raw to imdg
-				IgniteCache<String, String> sourceOutputMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
-				sourceOutputMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
-				sourceOutputMetaCache.putIfAbsent("1", sourceOutput.getId() + "-1");
+//				IgniteCache<String, String> sourceOutputMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
+//				sourceOutputMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
+//				sourceOutputMetaCache.putIfAbsent("1", sourceOutput.getId() + "-1");
+//
+//				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
+//				tokenizerOutputMetaCache.putIfAbsent("0", tokenizerOutput.getId() + "-0");
+//				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+//
+//				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+//				counterOutputMetaCache.putIfAbsent("0", counterOutput.getId() + "-0");
+//				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
 
-				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-				tokenizerOutputMetaCache.putIfAbsent("0", tokenizerOutput.getId() + "-0");
-				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+//                try {
+//                    Thread.sleep(10000);
+//                } catch (InterruptedException e) {
+//                    throw new RuntimeException(e);
+//                }
+//
+//                // Switch back channels from imdg to raw
+//				sourceOutputMetaCache.remove("0");
+//				sourceOutputMetaCache.remove("1");
+//
+//				tokenizerOutputMetaCache.remove("0");
+//				tokenizerOutputMetaCache.remove("1");
+//
+//				counterOutputMetaCache.remove("0");
 
-				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-				counterOutputMetaCache.putIfAbsent("0", counterOutput.getId() + "-0");
 
-                try {
-                    Thread.sleep(10000);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
 
-                // Switch back channels from imdg to raw
-				sourceOutputMetaCache.remove("0");
-				sourceOutputMetaCache.remove("1");
-
-				tokenizerOutputMetaCache.remove("0");
-				tokenizerOutputMetaCache.remove("1");
-
-				counterOutputMetaCache.remove("0");
- */
-
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
+//
 				//testing: migrating operator instance
+				//example: migrating Counter instance (index: 1)
+				//1. change input and output channels to IMDG
 				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
 				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
+
+				//add delay to reflect changes
+				try {
+					Thread.sleep(5000);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
+
+				//2. Pause old instance
+				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+
+				//3. Update second job with the following parameters:
+				System.out.println("Tokenizer output id: " + tokenizerOutput.getId());
+				System.out.println("Counter output id: " + counterOutput.getId());
+
+
 			}
 
 			@Override
@@ -167,7 +198,7 @@ public class WordCountHybrid {
 			}
 		});
 
-		env.execute("Flink Ignite");
+		env.execute("WordCount on StreamPlane");
 
 	}
 
@@ -187,6 +218,14 @@ public class WordCountHybrid {
 		@Override
 		public int partition(String key, int numPartitions) {
 			return Math.abs(key.hashCode() % numPartitions);
+		}
+	}
+
+	public static class CustomForwardPartitioner implements Partitioner<Integer> {
+
+		@Override
+		public int partition(Integer key, int numPartitions) {
+			return key;
 		}
 	}
 

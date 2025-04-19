@@ -63,6 +63,7 @@ public class WordCountHybrid_2 {
 		final ParameterTool params = ParameterTool.fromArgs(args);
 		final String topic = params.get("topic", "t9");
 		final int p = params.getInt("p", env.getParallelism());
+		final boolean pausedJob = params.getBoolean("paused", true);
 
 		Properties producerProps = new Properties();
 		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
@@ -70,7 +71,7 @@ public class WordCountHybrid_2 {
 		OutputStream sourceOutput = new OutputStream(p, new CustomRebalancePartitioner());
 
 		DataStream<Tuple3<Integer, Integer, String>> source = env
-				.addSource(new SourceGeneratorFunctionHybrid(sourceOutput))
+				.addSource(new SourceGeneratorFunctionHybrid(pausedJob, sourceOutput))
 				.setParallelism(1);
 
 		OutputStream tokenizerOutput = new OutputStream(p, new CustomHashPartitioner());
@@ -81,7 +82,7 @@ public class WordCountHybrid_2 {
 				.name("Tokenizer")
 				.setParallelism(p);
 
-		OutputStream counterOutput = new OutputStream(1, new CustomHashPartitioner());
+		OutputStream counterOutput = new OutputStream(p, new WordCountHybrid.CustomForwardPartitioner());
 
 		DataStream<Tuple3<Integer, Integer, String>> counter = tokenizer
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
@@ -93,15 +94,16 @@ public class WordCountHybrid_2 {
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
 				.addSink(new SinkFunctionHybrid(counterOutput.getId()))
 				.name("Sink")
-				.setParallelism(1);
+				.setParallelism(p);
 
 		env.registerJobListener(new JobListener() {
 			@Override
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
+				System.out.println("Job id 2: " + jobId);
 				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
-//testing: instance-status
 /*
+				//testing: instance-status
 				try {
 					Thread.sleep(5000);
 				} catch (InterruptedException e) {
@@ -121,7 +123,6 @@ public class WordCountHybrid_2 {
 
 				tokenizerOperatorCache.put("instance-status-0", "Running"); //<instance_index>,<status>
 				tokenizerOperatorCache.put("instance-status-1", "Running"); //<instance_index>,<status>
-*/
 
 				try {
 					Thread.sleep(5000);
@@ -129,46 +130,52 @@ public class WordCountHybrid_2 {
 					throw new RuntimeException(e);
 				}
 
-				// Switch all channels from raw to imdg
-//				IgniteCache<String, String> tokenizerChannelMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
-//				tokenizerChannelMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
-//				tokenizerChannelMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
+				// Switch channels from raw to imdg
+				IgniteCache<String, String> sourceOutputMetaCache = ignite.getOrCreateCache(sourceOutput.getId());
+				sourceOutputMetaCache.putIfAbsent("0", sourceOutput.getId() + "-0");
+				sourceOutputMetaCache.putIfAbsent("1", sourceOutput.getId() + "-1");
 
+				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
+				tokenizerOutputMetaCache.putIfAbsent("0", tokenizerOutput.getId() + "-0");
+				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
 
-//				IgniteCache<String, String> counterChannelMetaCache = ignite.getOrCreateCache(jobId + "-Counter-OUT");
-//				counterChannelMetaCache.putIfAbsent("0", jobId + "-Counter-OUT-0"); //<channel_index>,<queue_key>
-//				counterChannelMetaCache.putIfAbsent("1", jobId + "-Counter-OUT-1"); //<channel_index>,<queue_key>
+				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+				counterOutputMetaCache.putIfAbsent("0", counterOutput.getId() + "-0");
 
-				IgniteCache<String, String> sinkChannelMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-				sinkChannelMetaCache.putIfAbsent("0", counterOutput.getId() + "-0"); //<channel_index>,<queue_key>
-//				sinkChannelMetaCache.putIfAbsent("1", jobId + "-Sink: Sink-OUT-1"); //<channel_index>,<queue_key>
+                try {
+                    Thread.sleep(10000);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
 
-//                try {
-//                    Thread.sleep(5000);
-//                } catch (InterruptedException e) {
-//                    throw new RuntimeException(e);
-//                }
-//				System.out.println("#### 4");
-//                // Switch back all channels from imdg to raw
-//				tokenizerChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
-//				tokenizerChannelMetaCache.remove("1"); //<channel_index>,<queue_key>
-//
+                // Switch back channels from imdg to raw
+				sourceOutputMetaCache.remove("0");
+				sourceOutputMetaCache.remove("1");
+
+				tokenizerOutputMetaCache.remove("0");
+				tokenizerOutputMetaCache.remove("1");
+
+				counterOutputMetaCache.remove("0");
+ */
+
 //				try {
 //					Thread.sleep(5000);
 //				} catch (InterruptedException e) {
 //					throw new RuntimeException(e);
 //				}
-//				System.out.println("#### 5");
-//				counterChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
-//				counterChannelMetaCache.remove("1"); //<channel_index>,<queue_key>
-//
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
 
-				sinkChannelMetaCache.remove("0"); //<channel_index>,<queue_key>
+				//testing: migrating operator instance in second job
+				//example: migrating Counter instance (index: 1)
+				//1. change input-stream of Counter to IMDG from first job
+				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+				counterOperatorCache.put("input-stream-1", "<origin_tokenizer_output_stream_id>");
+
+				//2. change output-stream of Counter to first job's Counter's output
+				counterOperatorCache.put("output-stream-1", "<origin_counter_output_stream_id>");
+
+				//3. Resume processing
+				counterOperatorCache.put("instance-status-1", "Running");
+
 			}
 
 			@Override
@@ -177,7 +184,7 @@ public class WordCountHybrid_2 {
 			}
 		});
 
-		env.execute("Flink Ignite");
+		env.execute("WordCount on StreamPlane");
 
 	}
 
@@ -197,6 +204,14 @@ public class WordCountHybrid_2 {
 		@Override
 		public int partition(String key, int numPartitions) {
 			return Math.abs(key.hashCode() % numPartitions);
+		}
+	}
+
+	public static class CustomForwardPartitioner implements Partitioner<Integer> {
+
+		@Override
+		public int partition(Integer key, int numPartitions) {
+			return key;
 		}
 	}
 

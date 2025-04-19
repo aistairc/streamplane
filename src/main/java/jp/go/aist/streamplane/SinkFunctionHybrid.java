@@ -25,7 +25,7 @@ import java.util.stream.Collectors;
 public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer, String>> {
 
     private String defaultInputStreamId;
-    private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> inputQueues;
+    private IgniteQueue<Tuple3<Integer, Integer, String>> inputQueue;
 
     private final Map<String, String> operatorMeta;
 
@@ -33,7 +33,6 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
 
     public SinkFunctionHybrid(String defaultInputStreamId){
         this.defaultInputStreamId = defaultInputStreamId;
-        this.inputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
     }
 
@@ -41,20 +40,27 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
     public void open(OpenContext openContext) throws Exception {
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
         String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
 
-        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+        operatorMetaCache.put("parallelism", String.valueOf(getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks()));
+
+        operatorMetaCache.put("task-name-" + subtaskIndex, getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks());
+        operatorMetaCache.put("allocation-id-" + subtaskIndex, getRuntimeContext().getTaskInfo().getAllocationIDAsString());
+
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, "Running");
         if(instanceStatus != null && instanceStatus.equals("Paused")){
-            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Paused");
+            operatorMeta.put("instance-status-" + subtaskIndex, "Paused");
         } else {
-            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+            operatorMeta.put("instance-status-" + subtaskIndex, "Running");
         }
 
-        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream", this.defaultInputStreamId);
+        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream-" + subtaskIndex, this.defaultInputStreamId);
         if(inputStream == null){
             inputStream = this.defaultInputStreamId;
         }
-        operatorMeta.put("input-stream", inputStream);
+        operatorMeta.put("input-stream-" + subtaskIndex, inputStream);
+        inputQueue = ignite.queue(inputStream + "-" + subtaskIndex, 0, ImdgConfig.QUEUE_CONFIG());
 
         createContinousQuery(operatorMetaCacheKey, operatorMeta); //cache_id: <job_id>-task-<this_task_name>
     }
@@ -70,12 +76,16 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
                             if(e.getEventType() == EventType.REMOVED) {
                                 entries.remove(e.getKey());
                             } else {
+                                entries.put(e.getKey(), e.getValue());
                                 if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) && e.getValue().equals("Running")){
                                     synchronized (operatorMeta) {
                                         operatorMeta.notifyAll();
                                     }
                                 }
-                                entries.put(e.getKey(), e.getValue());
+
+                                if(e.getKey().equals("input-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    inputQueue = ignite.queue(e.getValue() + "-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), 0, ImdgConfig.QUEUE_CONFIG());
+                                }
                             }
                         }
                     }
@@ -94,40 +104,45 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
         Integer channelType = input.f1;
         String word = input.f2;
         do {
-            if(channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()){
-                throw new Exception("Channel index of received tuples does not match this subtask");
+            if(channelType == -1) { //paused job
+                synchronized (operatorMeta) {
+                    operatorMeta.wait();
+                    channelType = 1; //switch to IMDG when resumed
+                }
+            } else {
+                if (channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) {
+                    throw new Exception("Channel index of received tuples does not match this subtask");
+                }
+
+                System.err.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+                        channelType == 1 ? "In-memory": "Built-in",
+                        word);
+
             }
 
-            System.out.println(channelType + " | " + word);
-
-            if(operatorMeta.getOrDefault("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running").equals("Paused")){
+            int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused")){
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
                 }
             }
 
             //get next tuple
-            String inputStreamKey = operatorMeta.getOrDefault("input-stream", this.defaultInputStreamId);
-            String inputQueueKey = inputStreamKey + "-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             if (channelType == 1) { // imdg
-                IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.computeIfAbsent(inputQueueKey, k -> ignite.queue(inputQueueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                Tuple3<Integer, Integer, String> tuple = queue.take();
+                Tuple3<Integer, Integer, String> tuple = inputQueue.take();
                 channelIndex = tuple.f0;
                 channelType = tuple.f1;
                 word = tuple.f2;
                 continue;
             } else {
-                if(inputQueues.containsKey(inputQueueKey)) {
-                    IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.get(inputQueueKey);
-                    if (!queue.isEmpty()) { //process inputs in IMDG if exists
-                        Tuple3<Integer, Integer, String> tuple = queue.take();
-                        channelIndex = tuple.f0;
-                        channelType = tuple.f1;
-                        word = tuple.f2;
-                        continue;
-                    } else {
-                        inputQueues.remove(inputQueueKey).close();
-                    }
+                if (!inputQueue.isEmpty()) { //process inputs in IMDG if exists
+                    Tuple3<Integer, Integer, String> tuple = inputQueue.take();
+                    channelIndex = tuple.f0;
+                    channelType = tuple.f1;
+                    word = tuple.f2;
+                    continue;
+                } else {
+//                    inputQueue.close();
                 }
             }
         } while (channelType == 1);

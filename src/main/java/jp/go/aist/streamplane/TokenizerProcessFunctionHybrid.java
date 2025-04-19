@@ -16,62 +16,72 @@ import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 
 public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>> {
 
     private String defaultInputStreamId;
-    private final OutputStream[] outputStreams;
+    private final OutputStream defaultOutputStream;
     private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> outputQueues;
-    private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> inputQueues;
+    private IgniteQueue<Tuple3<Integer, Integer, String>> inputQueue;
 
-    private final Map<String, String> operatorMeta;
-    private final Map<String, Map<String, String>> outputChannelMetas;
+    private final Map<String, String> operatorMeta; // status: running/paused,
+    private final Map<String, String> defaultOutputChannelMeta;
+    private String currentOutputStreamId;
+    private Map<String, String> currentOutputChannelMeta;
 
     private Ignite ignite;
 
-    public TokenizerProcessFunctionHybrid(String defaultInputStreamId, OutputStream... outputStreams){
+    public TokenizerProcessFunctionHybrid(String defaultInputStreamId, OutputStream defaultOutputStream){
         this.defaultInputStreamId = defaultInputStreamId;
-        this.outputStreams = outputStreams;
-        this.inputQueues = new ConcurrentHashMap<>();
+        this.defaultOutputStream = defaultOutputStream;
         this.outputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
-        this.outputChannelMetas = new ConcurrentHashMap<>();
+        this.defaultOutputChannelMeta = new ConcurrentHashMap<>();
+        this.currentOutputChannelMeta = new ConcurrentHashMap<>();
     }
 
     @Override
     public void open(OpenContext openContext) throws Exception {
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
         String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
 
-        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+        operatorMetaCache.put("parallelism", String.valueOf(getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks()));
+
+        operatorMetaCache.put("task-name-" + subtaskIndex, getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks());
+        operatorMetaCache.put("allocation-id-" + subtaskIndex, getRuntimeContext().getTaskInfo().getAllocationIDAsString());
+
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, "Running");
         if(instanceStatus != null && instanceStatus.equals("Paused")){
-            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Paused");
+            operatorMeta.put("instance-status-" + subtaskIndex, "Paused");
         } else {
-            operatorMeta.put("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running");
+            operatorMeta.put("instance-status-" + subtaskIndex, "Running");
         }
 
-        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream", this.defaultInputStreamId);
+        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream-" + subtaskIndex, this.defaultInputStreamId);
         if(inputStream == null){
             inputStream = this.defaultInputStreamId;
         }
-        operatorMeta.put("input-stream", inputStream);
+        operatorMeta.put("input-stream-" + subtaskIndex, inputStream);
+        inputQueue = ignite.queue(inputStream + "-" + subtaskIndex, 0, ImdgConfig.QUEUE_CONFIG());
 
-        String outputStreamIds = Arrays.stream(outputStreams).map(c -> c.getId()).collect(Collectors.joining(","));
-        operatorMetaCache.put("output-stream", outputStreamIds);
-        operatorMeta.put("output-stream", outputStreamIds);
+        currentOutputStreamId = operatorMetaCache.getAndPutIfAbsent("output-stream-" + subtaskIndex, defaultOutputStream.getId());
+        if(currentOutputStreamId == null){
+            currentOutputStreamId = defaultOutputStream.getId();
+        }
+        operatorMeta.put("output-stream-" + subtaskIndex, currentOutputStreamId);
+        if(currentOutputStreamId.equals(defaultOutputStream.getId())){
+            this.currentOutputChannelMeta = defaultOutputChannelMeta;
+        }
 
         createContinousQuery(operatorMetaCacheKey, operatorMeta); //cache_id: <job_id>-task-<this_task_name>
 
-        for(OutputStream outputStream : outputStreams) {
-            String key = outputStream.getId();
-            createContinousQuery(key, outputChannelMetas.computeIfAbsent(key, k -> new ConcurrentHashMap<>()));
-        }
+        //only listen changes to the default output stream
+        createContinousQuery(defaultOutputStream.getId(), defaultOutputChannelMeta);
     }
 
     private void createContinousQuery(String cacheKey, final Map<String, String> entries){
@@ -86,12 +96,32 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
                                 entries.remove(e.getKey());
                             } else {
 //                                System.out.println("New entry: " + e.getKey() + ": " + e.getValue());
+                                entries.put(e.getKey(), e.getValue());
                                 if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) && e.getValue().equals("Running")){
                                     synchronized (operatorMeta) {
                                         operatorMeta.notifyAll();
                                     }
                                 }
-                                entries.put(e.getKey(), e.getValue());
+
+                                if(e.getKey().equals("input-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    inputQueue = ignite.queue(e.getValue() + "-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), 0, ImdgConfig.QUEUE_CONFIG());
+                                }
+
+                                if(e.getKey().equals("output-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    currentOutputStreamId = e.getValue();
+                                    if(currentOutputStreamId.equals(defaultOutputStream.getId())){
+                                        currentOutputChannelMeta = defaultOutputChannelMeta;
+                                    } else {
+                                        IgniteCache<String, String> outputCache = ignite.getOrCreateCache(currentOutputStreamId);
+                                        currentOutputChannelMeta = new ConcurrentHashMap<>();
+                                        outputCache.forEach(entry -> {currentOutputChannelMeta.put(entry.getKey(), entry.getValue());});
+                                    }
+                                    //update the outputQueues
+                                    for(String index : currentOutputChannelMeta.keySet()){
+                                        String queueKey = currentOutputStreamId + "-" + index;
+                                        outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -110,32 +140,32 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
         Integer channelType = input.f1;
         String sentence = input.f2;
         do {
-            if(channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()){
-                throw new Exception("Channel index of received tuples does not match this subtask");
-            }
+            if(channelType == -1) { //paused job
+                if(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 0) {
+                    for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
+                        collector.collect(Tuple3.of(i, -1, null));
+                    }
+                }
+                synchronized (operatorMeta) {
+                    operatorMeta.wait();
+                    channelType = 1; //switch to IMDG when resumed
+                }
+            } else {
+                if(channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()){
+                    throw new Exception("Channel index of received tuples does not match this subtask");
+                }
 
-            String[] words = sentence.toLowerCase().split("\\W+");
-            for (String word : words) {
-                for(OutputStream outputStream : outputStreams){
-                    Integer destChannel = outputStream.getNextChannelToSendTo(word);
-                    String outputStreamId = outputStream.getId();
-                    String queueKey = outputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
-                    if(outputChannelMetas.containsKey(outputStreamId)){
-                        Map<String, String> channelMeta = outputChannelMetas.get(outputStreamId);
-                        if (channelMeta.containsKey(destChannel.toString())) {
-                            if(outputQueues.containsKey(queueKey)) {
-                                IgniteQueue<Tuple3<Integer, Integer, String>> queue = outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                                queue.add(Tuple3.of(destChannel, 1, word));
-                            } else { //switching: raw >> imdg
-                                outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                                collector.collect(Tuple3.of(destChannel, 1, word));
-                            }
-                        } else {
-                            if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
-                                outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, word));
-                            } else {
-                                collector.collect(Tuple3.of(destChannel, 0, word));
-                            }
+                String[] words = sentence.toLowerCase().split("\\W+");
+                for (String word : words) {
+                    Thread.sleep(1000);
+                    Integer destChannel = defaultOutputStream.getNextChannelToSendTo(word);
+                    String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
+                    if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
+                        if(outputQueues.containsKey(queueKey)) {
+                            outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, word));
+                        } else { //switching: raw >> imdg
+                            outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
+                            collector.collect(Tuple3.of(destChannel, 1, word));
                         }
                     } else {
                         if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
@@ -149,7 +179,8 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
 
             //check operator status. operator can be deactivated if the input and output channels are IMDG
             //Thus, deactivation make this operator stop listening inputs from IMDG channels
-            if(operatorMeta.getOrDefault("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running").equals("Paused")){
+            int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused")){
 //                System.out.printf("[%d] %s\n", getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "paused");
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
@@ -158,27 +189,21 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
             }
 
             //get next tuple
-            String inputStreamKey = operatorMeta.getOrDefault("input-stream", this.defaultInputStreamId);
-            String inputQueueKey = inputStreamKey + "-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
             if (channelType == 1) { // imdg
-                IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.computeIfAbsent(inputQueueKey, k -> ignite.queue(inputQueueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                Tuple3<Integer, Integer, String> tuple = queue.take();
+                Tuple3<Integer, Integer, String> tuple = inputQueue.take();
                 channelIndex = tuple.f0;
                 channelType = tuple.f1;
                 sentence = tuple.f2;
                 continue;
             } else {
-                if(inputQueues.containsKey(inputQueueKey)) {
-                    IgniteQueue<Tuple3<Integer, Integer, String>> queue = inputQueues.get(inputQueueKey);
-                    if (!queue.isEmpty()) { //process inputs in IMDG if exists
-                        Tuple3<Integer, Integer, String> tuple = queue.take();
-                        channelIndex = tuple.f0;
-                        channelType = tuple.f1;
-                        sentence = tuple.f2;
-                        continue;
-                    } else {
-                        inputQueues.remove(inputQueueKey).close();
-                    }
+                if (!inputQueue.isEmpty()) { //process inputs in IMDG if exists
+                    Tuple3<Integer, Integer, String> tuple = inputQueue.take();
+                    channelIndex = tuple.f0;
+                    channelType = tuple.f1;
+                    sentence = tuple.f2;
+                    continue;
+                } else {
+//                    inputQueue.close();
                 }
             }
         } while (channelType == 1);
