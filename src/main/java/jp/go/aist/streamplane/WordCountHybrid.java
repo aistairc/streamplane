@@ -53,26 +53,28 @@ public class WordCountHybrid {
 
 		// Sets up the execution environment, which is the main entry point
 		// to building Flink applications.
-		Configuration conf = new Configuration();
-		conf.setInteger("taskmanager.numberOfTaskSlots", 1);
-		conf.setInteger("local.number-taskmanager", 2); // for testing more than 1 task manager
-		final StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment(conf);
-//		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+//		Configuration conf = new Configuration();
+//		conf.setInteger("taskmanager.numberOfTaskSlots", 1);
+//		conf.setInteger("local.number-taskmanager", 2); // for testing more than 1 task manager
+//		final StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment(conf);
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(2);
 
 		final ParameterTool params = ParameterTool.fromArgs(args);
-		final String topic = params.get("topic", "t9");
-		final int p = params.getInt("p", env.getParallelism());
+		final int p = params.getInt("parallelism", env.getParallelism());
 		final boolean pausedJob = params.getBoolean("paused", false);
 
-		Properties producerProps = new Properties();
-		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
+		//for kafka
+//		final String topic = params.get("topic", "t9");
+//		Properties producerProps = new Properties();
+//		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
 
 		OutputStream sourceOutput = new OutputStream(p, new CustomRebalancePartitioner());
 
 		DataStream<Tuple3<Integer, Integer, String>> source = env
 				.addSource(new SourceGeneratorFunctionHybrid(pausedJob, sourceOutput))
-				.setParallelism(1);
+				.setParallelism(1)
+				.slotSharingGroup("Non-Migratable");;
 
 		OutputStream tokenizerOutput = new OutputStream(p, new CustomHashPartitioner());
 
@@ -80,7 +82,8 @@ public class WordCountHybrid {
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
 				.process(new TokenizerProcessFunctionHybrid(sourceOutput.getId(), tokenizerOutput))
 				.name("Tokenizer")
-				.setParallelism(p);
+				.setParallelism(p)
+				.slotSharingGroup("Non-Migratable");;
 
 		OutputStream counterOutput = new OutputStream(p, new CustomForwardPartitioner());
 
@@ -88,20 +91,22 @@ public class WordCountHybrid {
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
 				.process(new CounterProcessFunctionHybrid(tokenizerOutput.getId(), counterOutput))
 				.name("Counter")
-				.setParallelism(p);
+				.setParallelism(p)
+				.slotSharingGroup("Migratable");
 
 		DataStreamSink <Tuple3<Integer, Integer, String>> sink = counter
 				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
 				.addSink(new SinkFunctionHybrid(counterOutput.getId()))
 				.name("Sink")
-				.setParallelism(p);
+				.setParallelism(p)
+				.slotSharingGroup("Non-Migratable");
 
 		env.registerJobListener(new JobListener() {
 			@Override
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
 				System.out.println("Job id 1: " + jobId);
-				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+//				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
 
 				//testing: instance-status
 //				try {
@@ -166,24 +171,24 @@ public class WordCountHybrid {
 //					throw new RuntimeException(e);
 //				}
 //
-				//testing: migrating operator instance
-				//example: migrating Counter instance (index: 1)
-				//1. change input and output channels to IMDG
-				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
-				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
-
-				//add delay to reflect changes
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
-
-				//2. Pause old instance
-				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
-				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+//				//testing: migrating operator instance
+//				//example: migrating Counter instance (index: 1)
+//				//1. change input and output channels to IMDG
+//				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
+//				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+//				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+//				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
+//
+//				//add delay to reflect changes
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
+//
+//				//2. Pause old instance
+//				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+//				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
 
 				//3. Update second job with the following parameters:
 				System.out.println("Tokenizer output id: " + tokenizerOutput.getId());

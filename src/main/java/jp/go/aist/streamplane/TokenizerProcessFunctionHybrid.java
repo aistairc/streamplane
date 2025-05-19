@@ -157,7 +157,6 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
 
                 String[] words = sentence.toLowerCase().split("\\W+");
                 for (String word : words) {
-                    Thread.sleep(1000);
                     Integer destChannel = defaultOutputStream.getNextChannelToSendTo(word);
                     String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
                     if (currentOutputChannelMeta.containsKey(destChannel.toString())) {

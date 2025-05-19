@@ -163,7 +163,7 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
                 }
             }
 
-//            Thread.sleep(1000);
+            Thread.sleep(1000);
             nextIndex = Math.abs(indexIterator.getAndIncrement());
             nextSentence = WordCountData.WORDS[nextIndex % WordCountData.WORDS.length];
         }

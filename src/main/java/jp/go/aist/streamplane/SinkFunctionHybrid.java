@@ -114,9 +114,9 @@ public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer
                     throw new Exception("Channel index of received tuples does not match this subtask");
                 }
 
-                System.err.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
-                        channelType == 1 ? "In-memory": "Built-in",
-                        word);
+//                System.out.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+//                        channelType == 1 ? "In-memory": "Built-in",
+//                        word);
 
             }
 

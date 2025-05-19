@@ -36,6 +36,8 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
 
     private final Map<String, IgniteAtomicLong> counters;
 
+    private boolean runningFlag = false;
+
     public CounterProcessFunctionHybrid(String defaultInputStreamId, OutputStream defaultOutputStream){
         this.defaultInputStreamId = defaultInputStreamId;
         this.defaultOutputStream = defaultOutputStream;
@@ -157,9 +159,14 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                     throw new Exception("Channel index of received tuples does not match this subtask");
                 }
 
-                System.out.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
-                        channelType == 1 ? "In-memory": "Built-in",
-                        word);
+                if (!runningFlag){
+                    System.out.println(getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks() + " is SENDING at " + System.currentTimeMillis());
+                    runningFlag = true;
+                }
+
+//                System.out.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+//                        channelType == 1 ? "In-memory": "Built-in",
+//                        word);
 
                 final String atomicKey = word;
                 Long count = counters.computeIfAbsent(word, k -> ignite.atomicLong(atomicKey, 0, true)).incrementAndGet();
@@ -184,7 +191,7 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
 
             //check operator status
             int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused")){
+            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused") && channelType == 1){
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
                 }
