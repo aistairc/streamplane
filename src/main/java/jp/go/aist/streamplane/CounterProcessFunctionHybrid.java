@@ -1,5 +1,6 @@
 package jp.go.aist.streamplane;
 
+import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -7,18 +8,15 @@ import org.apache.flink.util.Collector;
 import org.apache.ignite.*;
 import org.apache.ignite.cache.query.ContinuousQuery;
 import org.apache.ignite.cache.query.ScanQuery;
-import org.apache.ignite.configuration.CollectionConfiguration;
 
 import javax.cache.Cache;
 import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 
 public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>> {
 
@@ -171,7 +169,7 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                 final String atomicKey = word;
                 Long count = counters.computeIfAbsent(word, k -> ignite.atomicLong(atomicKey, 0, true)).incrementAndGet();
                 String msg = word + ":" + count;
-                Integer destChannel = defaultOutputStream.getNextChannelToSendTo(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
+                Integer destChannel = defaultOutputStream.getNextChannelToSendTo(null);
                 String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
                 if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
                     if(outputQueues.containsKey(queueKey)) {

@@ -16,20 +16,40 @@
  * limitations under the License.
  */
 
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcount;
 
+import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.operators.DynamicProcessFunction;
+import jp.go.aist.streamplane.operators.DynamicSinkFunction;
+import jp.go.aist.streamplane.operators.DynamicSourceFunction;
+import jp.go.aist.streamplane.stream.InputStream;
+import jp.go.aist.streamplane.events.StreamEvent;
 import jp.go.aist.streamplane.stream.OutputStream;
+import jp.go.aist.streamplane.stream.partitioners.StreamPlaneDefaultChannelPartitioner;
+import jp.go.aist.streamplane.stream.partitioners.StreamPlaneForwardPartitioner;
+import jp.go.aist.streamplane.stream.partitioners.StreamPlaneHashPartitioner;
+import jp.go.aist.streamplane.stream.partitioners.StreamPlaneRebalancePartitioner;
 import org.apache.flink.api.common.JobExecutionResult;
-import org.apache.flink.api.common.functions.Partitioner;
-import org.apache.flink.api.java.tuple.Tuple3;
+import org.apache.flink.api.java.tuple.Tuple1;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.JobListener;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.ignite.Ignite;
+import org.apache.ignite.IgniteAtomicLong;
+import org.apache.ignite.IgniteCache;
+import org.apache.ignite.Ignition;
 
 import javax.annotation.Nullable;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Skeleton for a Flink DataStream Job.
@@ -43,17 +63,17 @@ import javax.annotation.Nullable;
  * <p>If you change the name of the main class (with the public static void main(String[] args))
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
-public class WordCountHybrid {
+public class WordCount {
 
 	public static void main(String[] args) throws Exception {
 
 		// Sets up the execution environment, which is the main entry point
 		// to building Flink applications.
-//		Configuration conf = new Configuration();
-//		conf.setInteger("taskmanager.numberOfTaskSlots", 1);
-//		conf.setInteger("local.number-taskmanager", 2); // for testing more than 1 task manager
-//		final StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment(conf);
-		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+		Configuration conf = new Configuration();
+		conf.setInteger("taskmanager.numberOfTaskSlots", 1);
+		conf.setInteger("local.number-taskmanager", 4); // for testing more than 1 task manager
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment(conf);
+//		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(2);
 
 		final ParameterTool params = ParameterTool.fromArgs(args);
@@ -65,34 +85,77 @@ public class WordCountHybrid {
 //		Properties producerProps = new Properties();
 //		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
 
-		OutputStream sourceOutput = new OutputStream(p, new CustomRebalancePartitioner());
+		OutputStream sourceOutput = new OutputStream(p, new StreamPlaneRebalancePartitioner());
 
-		DataStream<Tuple3<Integer, Integer, String>> source = env
-				.addSource(new SourceGeneratorFunctionHybrid(pausedJob, sourceOutput))
+		DataStream<StreamEvent> source = env
+				.addSource(new DynamicSourceFunction<Tuple1<String>>(sourceOutput, pausedJob) {
+
+					@Override
+					public Tuple1<String> generateNextTuple(Long index) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                        return Tuple1.of(WordCountData.WORDS[Math.toIntExact(index % WordCountData.WORDS.length)]);
+					}
+				})
 				.setParallelism(1)
-				.slotSharingGroup("Non-Migratable");;
+				.slotSharingGroup("Non-Migratable");
 
-		OutputStream tokenizerOutput = new OutputStream(p, new CustomHashPartitioner());
+		OutputStream tokenizerOutput = new OutputStream(p, new StreamPlaneHashPartitioner<String>(), 0);
 
-		DataStream<Tuple3<Integer, Integer, String>> tokenizer = source
-				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
-				.process(new TokenizerProcessFunctionHybrid(sourceOutput.getId(), tokenizerOutput))
+		DataStream<StreamEvent> tokenizer = source
+				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
+				.process(new DynamicProcessFunction<Tuple1<String>, Tuple1<String>>(
+						new InputStream[]{new InputStream(sourceOutput.getId())},
+						tokenizerOutput) {
+
+					@Override
+					public List<Tuple1<String>> processDataTuple(Tuple1<String> input) {
+						return Arrays.stream(input.f0.toLowerCase().split("\\W+")).map(word -> Tuple1.of(word)).collect(Collectors.toList());
+					}
+				})
 				.name("Tokenizer")
 				.setParallelism(p)
-				.slotSharingGroup("Non-Migratable");;
+				.slotSharingGroup("Non-Migratable");
 
-		OutputStream counterOutput = new OutputStream(p, new CustomForwardPartitioner());
+		OutputStream counterOutput = new OutputStream(p, new StreamPlaneForwardPartitioner());
 
-		DataStream<Tuple3<Integer, Integer, String>> counter = tokenizer
-				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
-				.process(new CounterProcessFunctionHybrid(tokenizerOutput.getId(), counterOutput))
+
+		DataStream<StreamEvent> counter = tokenizer
+				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
+				.process(new DynamicProcessFunction<Tuple1<String>, Tuple2<String, Long>>(
+						new InputStream[]{new InputStream(tokenizerOutput.getId())},
+						counterOutput
+				) {
+
+					private final Map<String, IgniteAtomicLong> counters = new ConcurrentHashMap<>(); //state
+
+					@Override
+					public List<Tuple2<String, Long>> processDataTuple(Tuple1<String> input) {
+						Long count = counters.computeIfAbsent(input.f0, k -> getIgniteClient().atomicLong(input.f0, 0, true)).incrementAndGet();
+						return List.of(new Tuple2<>(input.f0, count));
+					}
+
+				})
 				.name("Counter")
 				.setParallelism(p)
 				.slotSharingGroup("Migratable");
 
-		DataStreamSink <Tuple3<Integer, Integer, String>> sink = counter
-				.partitionCustom(new ChannelPartitioner(), tuple -> tuple.f0)
-				.addSink(new SinkFunctionHybrid(counterOutput.getId()))
+		DataStreamSink <StreamEvent> sink = counter
+				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
+				.addSink(new DynamicSinkFunction<Tuple2<String, Long>>(
+						new InputStream[]{new InputStream(counterOutput.getId())}
+				) {
+
+					@Override
+					public void processDataTuple(Tuple2<String, Long> input) {
+						System.out.printf("[%s] Message: %s\n",
+								getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+								input.f0 + ": " + input.f1);
+					}
+				})
 				.name("Sink")
 				.setParallelism(p)
 				.slotSharingGroup("Non-Migratable");
@@ -102,11 +165,11 @@ public class WordCountHybrid {
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
 				System.out.println("Job id 1: " + jobId);
-//				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
 
 				//testing: instance-status
 //				try {
-//					Thread.sleep(5000);
+//					Thread.sleep(10000);
 //				} catch (InterruptedException e) {
 //					throw new RuntimeException(e);
 //				}
@@ -143,7 +206,7 @@ public class WordCountHybrid {
 //				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
 //				counterOutputMetaCache.putIfAbsent("0", counterOutput.getId() + "-0");
 //				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
-
+//
 //                try {
 //                    Thread.sleep(10000);
 //                } catch (InterruptedException e) {
@@ -158,33 +221,34 @@ public class WordCountHybrid {
 //				tokenizerOutputMetaCache.remove("1");
 //
 //				counterOutputMetaCache.remove("0");
+//				counterOutputMetaCache.remove("1");
 
 
 
-//				try {
-//					Thread.sleep(5000);
-//				} catch (InterruptedException e) {
-//					throw new RuntimeException(e);
-//				}
+				try {
+					Thread.sleep(5000);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
 //
 //				//testing: migrating operator instance
 //				//example: migrating Counter instance (index: 1)
 //				//1. change input and output channels to IMDG
-//				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-//				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
-//				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-//				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
+				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
+				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
 //
 //				//add delay to reflect changes
-//				try {
-//					Thread.sleep(5000);
-//				} catch (InterruptedException e) {
-//					throw new RuntimeException(e);
-//				}
-//
+				try {
+					Thread.sleep(5000);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
+
 //				//2. Pause old instance
-//				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
-//				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
 
 				//3. Update second job with the following parameters:
 				System.out.println("Tokenizer output id: " + tokenizerOutput.getId());
@@ -202,40 +266,5 @@ public class WordCountHybrid {
 		env.execute("WordCount on StreamPlane");
 
 	}
-
-	public static class CustomRebalancePartitioner implements Partitioner<Integer> {
-
-		private int nextChannelToSendTo = 0;
-
-		@Override
-		public int partition(Integer key, int numPartitions) {
-			this.nextChannelToSendTo = (this.nextChannelToSendTo + 1) % numPartitions;
-			return this.nextChannelToSendTo;
-		}
-	}
-
-	public static class CustomHashPartitioner implements Partitioner<String> {
-
-		@Override
-		public int partition(String key, int numPartitions) {
-			return Math.abs(key.hashCode() % numPartitions);
-		}
-	}
-
-	public static class CustomForwardPartitioner implements Partitioner<Integer> {
-
-		@Override
-		public int partition(Integer key, int numPartitions) {
-			return key;
-		}
-	}
-
-	public static class ChannelPartitioner implements Partitioner<Integer> {
-		@Override
-		public int partition(Integer key, int numPartitions) {
-			return Math.abs(key) % numPartitions;
-		}
-	}
-
 
 }

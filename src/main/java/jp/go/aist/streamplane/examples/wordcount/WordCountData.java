@@ -1,4 +1,4 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcount;
 
 public class WordCountData {
 

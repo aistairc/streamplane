@@ -1,5 +1,6 @@
 package jp.go.aist.streamplane;
 
+import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -157,7 +158,7 @@ public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integ
 
                 String[] words = sentence.toLowerCase().split("\\W+");
                 for (String word : words) {
-                    Integer destChannel = defaultOutputStream.getNextChannelToSendTo(word);
+                    Integer destChannel = defaultOutputStream.getNextChannelToSendTo(null);
                     String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
                     if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
                         if(outputQueues.containsKey(queueKey)) {

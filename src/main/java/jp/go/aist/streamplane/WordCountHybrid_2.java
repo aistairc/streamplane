@@ -18,6 +18,7 @@
 
 package jp.go.aist.streamplane;
 
+import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.functions.Partitioner;
 import org.apache.flink.api.java.tuple.Tuple3;

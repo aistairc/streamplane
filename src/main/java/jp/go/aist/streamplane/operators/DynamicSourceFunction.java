@@ -1,10 +1,15 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.operators;
 
-import jp.go.aist.streamplane.examples.wordcount.WordCountData;
+import jp.go.aist.streamplane.ImdgConfig;
 import jp.go.aist.streamplane.stream.OutputStream;
+import jp.go.aist.streamplane.events.ActivatorEvent;
+import jp.go.aist.streamplane.events.DataTuple;
+import jp.go.aist.streamplane.events.StreamEvent;
+import jp.go.aist.streamplane.stream.partitioners.StreamPlaneForwardPartitioner;
 import org.apache.flink.api.common.functions.OpenContext;
-import org.apache.flink.api.java.tuple.Tuple3;
+import org.apache.flink.api.java.tuple.Tuple;
 import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
+import org.apache.flink.util.Collector;
 import org.apache.ignite.Ignite;
 import org.apache.ignite.IgniteCache;
 import org.apache.ignite.IgniteQueue;
@@ -19,14 +24,14 @@ import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
-public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Integer, Integer, String>> {
+public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourceFunction<StreamEvent> {
 
     private final OutputStream defaultOutputStream;
-    private final AtomicInteger indexIterator;
-    private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> outputQueues;
+    private final AtomicLong indexIterator;
+    private final Map<String, IgniteQueue<StreamEvent>> outputQueues;
 
     private final Map<String, String> operatorMeta; // status: running/paused,
     private final Map<String, String> defaultOutputChannelMeta;
@@ -37,10 +42,18 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
 
     private boolean jobPaused;
 
-    public SourceGeneratorFunctionHybrid(boolean jobPaused, OutputStream defaultOutputStream) {
-        this.jobPaused = jobPaused;
+    private OperatorInstanceInfo operatorInstanceInfo;
+
+    private Collector<StreamEvent> collector;
+
+    protected DynamicSourceFunction(OutputStream defaultOutputStream) {
+        this(defaultOutputStream, false);
+    }
+
+    protected DynamicSourceFunction(OutputStream defaultOutputStream, boolean jobPaused) {
         this.defaultOutputStream = defaultOutputStream;
-        this.indexIterator = new AtomicInteger(0);
+        this.jobPaused = jobPaused;
+        this.indexIterator = new AtomicLong(0);
         this.outputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
         this.defaultOutputChannelMeta = new ConcurrentHashMap<>();
@@ -49,6 +62,10 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
 
     @Override
     public void open(OpenContext openContext) throws Exception {
+        this.operatorInstanceInfo = new OperatorInstanceInfo(
+                getRuntimeContext().getTaskInfo().getTaskName(),
+                getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
         String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
@@ -98,20 +115,25 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
                                         operatorMeta.notifyAll();
                                     }
                                 }
+
                                 if(e.getKey().equals("output-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
-                                    currentOutputStreamId = e.getValue();
-                                    if(currentOutputStreamId.equals(defaultOutputStream.getId())){
-                                        currentOutputChannelMeta = defaultOutputChannelMeta;
+                                    String newOutputStreamId = e.getValue();
+                                    Map<String, String> newOutputChannelMeta;
+                                    if(newOutputStreamId.equals(defaultOutputStream.getId())){
+                                        newOutputChannelMeta = defaultOutputChannelMeta;
                                     } else {
-                                        IgniteCache<String, String> outputCache = ignite.getOrCreateCache(currentOutputStreamId);
-                                        currentOutputChannelMeta = new ConcurrentHashMap<>();
-                                        outputCache.forEach(entry -> {currentOutputChannelMeta.put(entry.getKey(), entry.getValue());});
+                                        IgniteCache<String, String> outputCache = ignite.getOrCreateCache(newOutputStreamId);
+                                        newOutputChannelMeta = new ConcurrentHashMap<>();
+                                        outputCache.forEach(entry -> {newOutputChannelMeta.put(entry.getKey(), entry.getValue());});
                                     }
                                     //update the outputQueues
-                                    for(String index : currentOutputChannelMeta.keySet()){
-                                        String queueKey = currentOutputStreamId + "-" + index;
+                                    for(String index : newOutputChannelMeta.keySet()){
+                                        String queueKey = newOutputStreamId + "-" + index; //the physical output id
                                         outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
                                     }
+
+                                    currentOutputStreamId = newOutputStreamId;
+                                    currentOutputChannelMeta = newOutputChannelMeta;
                                 }
                             }
                         }
@@ -125,37 +147,43 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
         });
     }
 
+    public abstract OUT generateNextTuple(Long index);
+
     @Override
-    public void run(SourceContext<Tuple3<Integer, Integer, String>> sourceContext) throws Exception {
-        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-        while (jobPaused) {
-            if(subtaskIndex == 0) {
+    public void run(SourceContext<StreamEvent> sourceContext) throws Exception {
+        if (jobPaused) {
+            if(getRuntimeContext().getIndexOfThisSubtask() == 0) {
                 for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
-                    sourceContext.collect(Tuple3.of(i, -1, null));
+                    sourceContext.collect(new ActivatorEvent(operatorInstanceInfo, i, 0));
                 }
             }
             synchronized (operatorMeta) {
                 operatorMeta.wait();
             }
         }
-        int nextIndex = Math.abs(indexIterator.getAndIncrement());
-        String nextSentence = WordCountData.WORDS[nextIndex % WordCountData.WORDS.length];
+        long nextIndex = Math.abs(indexIterator.getAndIncrement());
+        Tuple nextTuple = generateNextTuple(nextIndex);
 
-        while (true){
-            Integer destChannel = defaultOutputStream.getNextChannelToSendTo(null);
+        while (nextTuple != null) {
+            Integer destChannel;
+            if(defaultOutputStream.getPartitioner() instanceof StreamPlaneForwardPartitioner){
+                destChannel = defaultOutputStream.getNextChannelToForwardTo(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
+            } else {
+                destChannel = defaultOutputStream.getNextChannelToSendTo(nextTuple);
+            }
             String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
             if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
                 if(outputQueues.containsKey(queueKey)) {
-                    outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, nextSentence));
+                    outputQueues.get(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
                 } else { //switching: raw >> imdg, or new output channel switching
                     outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                    sourceContext.collect(Tuple3.of(destChannel, 1, nextSentence));
+                    sourceContext.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
                 }
             } else {
                 if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
-                    outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, nextSentence));
+                    outputQueues.remove(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
                 } else {
-                    sourceContext.collect(Tuple3.of(destChannel, 0, nextSentence));
+                    sourceContext.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
                 }
             }
 
@@ -165,14 +193,17 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
                 }
             }
 
-            Thread.sleep(1000);
             nextIndex = Math.abs(indexIterator.getAndIncrement());
-            nextSentence = WordCountData.WORDS[nextIndex % WordCountData.WORDS.length];
+            nextTuple = generateNextTuple(nextIndex);
         }
     }
 
     @Override
     public void cancel() {
 
+    }
+
+    public Ignite getIgniteClient() {
+        return ignite;
     }
 }
