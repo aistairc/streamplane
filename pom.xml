@@ -97,6 +97,12 @@ under the License.
 			<version>${ignite.version}</version>
 			<scope>compile</scope>
 		</dependency>
+		<dependency>
+			<groupId>org.apache.beam</groupId>
+			<artifactId>beam-sdks-java-nexmark</artifactId>
+			<version>2.65.0</version>
+			<scope>compile</scope>
+		</dependency>
 <!--		<dependency>-->
 <!--			<groupId>org.apache.flink</groupId>-->
 <!--			<artifactId>flink-runtime-web</artifactId>-->
@@ -189,7 +195,7 @@ under the License.
 							<transformers>
 								<transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
 								<transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-									<mainClass>jp.go.aist.streamplane.WordCountHybrid</mainClass>
+									<mainClass>jp.go.aist.streamplane.examples.wordcount.WordCount</mainClass>
 								</transformer>
 							</transformers>
 						</configuration>

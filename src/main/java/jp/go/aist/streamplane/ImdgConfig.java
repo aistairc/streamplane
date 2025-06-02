@@ -46,4 +46,11 @@ public class ImdgConfig {
         return queueCfg;
     }
 
+    public static CollectionConfiguration SET_CONFIG(){
+        CollectionConfiguration setCfg = new CollectionConfiguration();
+        setCfg.setCollocated(true);
+        setCfg.setBackups(1);
+        return setCfg;
+    }
+
 }

@@ -1,5 +1,6 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcountlegacy;
 
+import jp.go.aist.streamplane.ImdgConfig;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
@@ -9,18 +10,15 @@ import org.apache.ignite.IgniteQueue;
 import org.apache.ignite.Ignition;
 import org.apache.ignite.cache.query.ContinuousQuery;
 import org.apache.ignite.cache.query.ScanQuery;
-import org.apache.ignite.configuration.CollectionConfiguration;
 
 import javax.cache.Cache;
 import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 
 public class SinkFunctionHybrid extends RichSinkFunction<Tuple3<Integer, Integer, String>> {
 

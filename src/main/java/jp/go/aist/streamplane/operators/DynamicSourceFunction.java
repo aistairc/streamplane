@@ -46,6 +46,8 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
 
     private Collector<StreamEvent> collector;
 
+    private IgniteCache<String, Object> states;
+
     protected DynamicSourceFunction(OutputStream defaultOutputStream) {
         this(defaultOutputStream, false);
     }
@@ -60,6 +62,20 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
         this.currentOutputChannelMeta = new ConcurrentHashMap<>();
     }
 
+    public Object putState(String stateKey, Object stateValue) {
+        states.put(stateKey, stateValue);
+        return stateValue;
+    }
+
+    public Object getState(String stateKey) {
+        return states.get(stateKey);
+    }
+
+    public String getStateIdPrefix(){
+        return getRuntimeContext().getJobInfo().getJobId().toString() + "-" +
+                getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
+    }
+
     @Override
     public void open(OpenContext openContext) throws Exception {
         this.operatorInstanceInfo = new OperatorInstanceInfo(
@@ -67,6 +83,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
                 getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
                 getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+        states = ignite.getOrCreateCache(getStateIdPrefix() + "-state");
         String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);

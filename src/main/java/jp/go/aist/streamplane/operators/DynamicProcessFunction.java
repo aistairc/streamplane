@@ -47,6 +47,8 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
 
     private Collector<StreamEvent> collector;
 
+    private IgniteCache<String, Object> states;
+
     public DynamicProcessFunction(InputStream[] defaultInputStreams, OutputStream defaultOutputStream){
         this.defaultInputStreams = defaultInputStreams;
         this.defaultOutputStream = defaultOutputStream;
@@ -57,6 +59,20 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
         this.currentOutputChannelMeta = new ConcurrentHashMap<>();
     }
 
+    public Object putState(String stateKey, Object stateValue) {
+        states.put(stateKey, stateValue);
+        return stateValue;
+    }
+
+    public Object getState(String stateKey) {
+        return states.get(stateKey);
+    }
+
+    public String getStateIdPrefix(){
+        return getRuntimeContext().getJobInfo().getJobId().toString() + "-" +
+                getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
+    }
+
     @Override
     public void open(OpenContext openContext) throws Exception {
         this.operatorInstanceInfo = new OperatorInstanceInfo(
@@ -64,6 +80,7 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
                 getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
                 getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+        states = ignite.getOrCreateCache(getStateIdPrefix() + "-state");
         String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
@@ -199,26 +216,28 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
         if(event instanceof DataTuple){
             DataTuple dataTuple = (DataTuple) event;
             List<OUT> newTuples = processDataTuple((IN) dataTuple.getData());
-            for(Tuple nextTuple : newTuples){
-                Integer destChannel;
-                if(defaultOutputStream.getPartitioner() instanceof StreamPlaneForwardPartitioner){
-                    destChannel = defaultOutputStream.getNextChannelToForwardTo(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
-                } else {
-                    destChannel = defaultOutputStream.getNextChannelToSendTo(nextTuple);
-                }
-                String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
-                if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
-                    if(outputQueues.containsKey(queueKey)) { //imdg
-                        outputQueues.get(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
-                    } else { //switching: raw >> imdg
-                        outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                        collector.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
+            if(newTuples != null){
+                for(Tuple nextTuple : newTuples){
+                    Integer destChannel;
+                    if(defaultOutputStream.getPartitioner() instanceof StreamPlaneForwardPartitioner){
+                        destChannel = defaultOutputStream.getNextChannelToForwardTo(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
+                    } else {
+                        destChannel = defaultOutputStream.getNextChannelToSendTo(nextTuple);
                     }
-                } else {
-                    if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
-                        outputQueues.remove(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
-                    } else { //raw
-                        collector.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
+                    String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
+                    if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
+                        if(outputQueues.containsKey(queueKey)) { //imdg
+                            outputQueues.get(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
+                        } else { //switching: raw >> imdg
+                            outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
+                            collector.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 1, nextTuple));
+                        }
+                    } else {
+                        if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
+                            outputQueues.remove(queueKey).add(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
+                        } else { //raw
+                            collector.collect(new DataTuple<Tuple>(operatorInstanceInfo, destChannel, 0, nextTuple));
+                        }
                     }
                 }
             }
@@ -242,6 +261,10 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
 
     public Ignite getIgniteClient() {
         return ignite;
+    }
+
+    public InputStream getDefaultInputStreams(int index) {
+        return defaultInputStreams[index];
     }
 
     private class QueueListenerThread extends Thread {

@@ -16,8 +16,9 @@
  * limitations under the License.
  */
 
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcountlegacy;
 
+import jp.go.aist.streamplane.ImdgConfig;
 import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.functions.Partitioner;
