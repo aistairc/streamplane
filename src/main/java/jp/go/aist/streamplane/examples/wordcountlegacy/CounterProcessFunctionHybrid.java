@@ -1,12 +1,12 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcountlegacy;
 
+import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
-import org.apache.ignite.Ignite;
-import org.apache.ignite.IgniteCache;
-import org.apache.ignite.IgniteQueue;
-import org.apache.ignite.Ignition;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.ignite.*;
 import org.apache.ignite.cache.query.ContinuousQuery;
 import org.apache.ignite.cache.query.ScanQuery;
 
@@ -17,14 +17,14 @@ import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
-public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Integer, Integer, String>> {
+public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>> {
 
+    private String defaultInputStreamId;
     private final OutputStream defaultOutputStream;
-    private final AtomicInteger indexIterator;
     private final Map<String, IgniteQueue<Tuple3<Integer, Integer, String>>> outputQueues;
+    private IgniteQueue<Tuple3<Integer, Integer, String>> inputQueue;
 
     private final Map<String, String> operatorMeta; // status: running/paused,
     private final Map<String, String> defaultOutputChannelMeta;
@@ -33,16 +33,18 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
 
     private Ignite ignite;
 
-    private boolean jobPaused;
+    private final Map<String, IgniteAtomicLong> counters;
 
-    public SourceGeneratorFunctionHybrid(boolean jobPaused, OutputStream defaultOutputStream) {
-        this.jobPaused = jobPaused;
+    private boolean runningFlag = false;
+
+    public CounterProcessFunctionHybrid(String defaultInputStreamId, OutputStream defaultOutputStream){
+        this.defaultInputStreamId = defaultInputStreamId;
         this.defaultOutputStream = defaultOutputStream;
-        this.indexIterator = new AtomicInteger(0);
         this.outputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
         this.defaultOutputChannelMeta = new ConcurrentHashMap<>();
         this.currentOutputChannelMeta = new ConcurrentHashMap<>();
+        this.counters = new ConcurrentHashMap<>();
     }
 
     @Override
@@ -63,6 +65,13 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
         } else {
             operatorMeta.put("instance-status-" + subtaskIndex, "Running");
         }
+
+        String inputStream = operatorMetaCache.getAndPutIfAbsent("input-stream-" + subtaskIndex, this.defaultInputStreamId);
+        if(inputStream == null){
+            inputStream = this.defaultInputStreamId;
+        }
+        operatorMeta.put("input-stream-" + subtaskIndex, inputStream);
+        inputQueue = ignite.queue(inputStream + "-" + subtaskIndex, 0, ImdgConfig.QUEUE_CONFIG());
 
         currentOutputStreamId = operatorMetaCache.getAndPutIfAbsent("output-stream-" + subtaskIndex, defaultOutputStream.getId());
         if(currentOutputStreamId == null){
@@ -96,6 +105,11 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
                                         operatorMeta.notifyAll();
                                     }
                                 }
+
+                                if(e.getKey().equals("input-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    inputQueue = ignite.queue(e.getValue() + "-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), 0, ImdgConfig.QUEUE_CONFIG());
+                                }
+
                                 if(e.getKey().equals("output-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
                                     currentOutputStreamId = e.getValue();
                                     if(currentOutputStreamId.equals(defaultOutputStream.getId())){
@@ -105,7 +119,7 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
                                         currentOutputChannelMeta = new ConcurrentHashMap<>();
                                         outputCache.forEach(entry -> {currentOutputChannelMeta.put(entry.getKey(), entry.getValue());});
                                     }
-                                    //update the outputQueues
+                                    //update the output queues
                                     for(String index : currentOutputChannelMeta.keySet()){
                                         String queueKey = currentOutputStreamId + "-" + index;
                                         outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
@@ -124,53 +138,82 @@ public class SourceGeneratorFunctionHybrid extends RichSourceFunction<Tuple3<Int
     }
 
     @Override
-    public void run(SourceContext<Tuple3<Integer, Integer, String>> sourceContext) throws Exception {
-        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-        while (jobPaused) {
-            if(subtaskIndex == 0) {
-                for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
-                    sourceContext.collect(Tuple3.of(i, -1, null));
+    public void processElement(Tuple3<Integer, Integer, String> input, ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>>.Context context, Collector<Tuple3<Integer, Integer, String>> collector) throws Exception {
+        Integer channelIndex = input.f0;
+        Integer channelType = input.f1;
+        String word = input.f2;
+        do {
+            if(channelType == -1) { //paused job
+                if(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 0) {
+                    for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
+                        collector.collect(Tuple3.of(i, -1, null));
+                    }
                 }
-            }
-            synchronized (operatorMeta) {
-                operatorMeta.wait();
-            }
-        }
-        int nextIndex = Math.abs(indexIterator.getAndIncrement());
-        String nextSentence = WordCountData.WORDS[nextIndex % WordCountData.WORDS.length];
-
-        while (true){
-            Integer destChannel = defaultOutputStream.getNextChannelToSendTo(nextIndex);
-            String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
-            if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
-                if(outputQueues.containsKey(queueKey)) {
-                    outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, nextSentence));
-                } else { //switching: raw >> imdg, or new output channel switching
-                    outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                    sourceContext.collect(Tuple3.of(destChannel, 1, nextSentence));
+                synchronized (operatorMeta) {
+                    operatorMeta.wait();
+                    channelType = 1; //switch to IMDG when resumed
                 }
             } else {
-                if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
-                    outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, nextSentence));
+                if (channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) {
+                    throw new Exception("Channel index of received tuples does not match this subtask");
+                }
+
+                if (!runningFlag){
+                    System.out.println(getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks() + " is SENDING at " + System.currentTimeMillis());
+                    runningFlag = true;
+                }
+
+//                System.out.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+//                        channelType == 1 ? "In-memory": "Built-in",
+//                        word);
+
+                final String atomicKey = word;
+                Long count = counters.computeIfAbsent(word, k -> ignite.atomicLong(atomicKey, 0, true)).incrementAndGet();
+                String msg = word + ":" + count;
+                Integer destChannel = defaultOutputStream.getNextChannelToSendTo(null);
+                String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
+                if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
+                    if(outputQueues.containsKey(queueKey)) {
+                        outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, msg));
+                    } else { //switching: raw >> imdg
+                        outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
+                        collector.collect(Tuple3.of(destChannel, 1, msg));
+                    }
                 } else {
-                    sourceContext.collect(Tuple3.of(destChannel, 0, nextSentence));
+                    if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
+                        outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, msg));
+                    } else {
+                        collector.collect(Tuple3.of(destChannel, 0, msg));
+                    }
                 }
             }
 
-            if(operatorMeta.getOrDefault("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running").equals("Paused")){
+            //check operator status
+            int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused") && channelType == 1){
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
                 }
             }
 
-            Thread.sleep(1000);
-            nextIndex = Math.abs(indexIterator.getAndIncrement());
-            nextSentence = WordCountData.WORDS[nextIndex % WordCountData.WORDS.length];
-        }
-    }
-
-    @Override
-    public void cancel() {
-
+            //get next tuple
+            if (channelType == 1) { // imdg
+                Tuple3<Integer, Integer, String> tuple = inputQueue.take();
+                channelIndex = tuple.f0;
+                channelType = tuple.f1;
+                word = tuple.f2;
+                continue;
+            } else {
+                if (!inputQueue.isEmpty()) { //process inputs in IMDG if exists
+                    Tuple3<Integer, Integer, String> tuple = inputQueue.take();
+                    channelIndex = tuple.f0;
+                    channelType = tuple.f1;
+                    word = tuple.f2;
+                    continue;
+                } else {
+//                    inputQueue.close();
+                }
+            }
+        } while (channelType == 1);
     }
 }

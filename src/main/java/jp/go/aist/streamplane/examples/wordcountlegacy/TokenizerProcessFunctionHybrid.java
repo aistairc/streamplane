@@ -1,26 +1,28 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.examples.wordcountlegacy;
 
+import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
-import org.apache.ignite.*;
+import org.apache.ignite.Ignite;
+import org.apache.ignite.IgniteCache;
+import org.apache.ignite.IgniteQueue;
+import org.apache.ignite.Ignition;
 import org.apache.ignite.cache.query.ContinuousQuery;
 import org.apache.ignite.cache.query.ScanQuery;
-import org.apache.ignite.configuration.CollectionConfiguration;
 
 import javax.cache.Cache;
 import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 
-public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>> {
+public class TokenizerProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>> {
 
     private String defaultInputStreamId;
     private final OutputStream defaultOutputStream;
@@ -34,18 +36,13 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
 
     private Ignite ignite;
 
-    private final Map<String, IgniteAtomicLong> counters;
-
-    private boolean runningFlag = false;
-
-    public CounterProcessFunctionHybrid(String defaultInputStreamId, OutputStream defaultOutputStream){
+    public TokenizerProcessFunctionHybrid(String defaultInputStreamId, OutputStream defaultOutputStream){
         this.defaultInputStreamId = defaultInputStreamId;
         this.defaultOutputStream = defaultOutputStream;
         this.outputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
         this.defaultOutputChannelMeta = new ConcurrentHashMap<>();
         this.currentOutputChannelMeta = new ConcurrentHashMap<>();
-        this.counters = new ConcurrentHashMap<>();
     }
 
     @Override
@@ -100,6 +97,7 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                             if(e.getEventType() == EventType.REMOVED) {
                                 entries.remove(e.getKey());
                             } else {
+//                                System.out.println("New entry: " + e.getKey() + ": " + e.getValue());
                                 entries.put(e.getKey(), e.getValue());
                                 if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) && e.getValue().equals("Running")){
                                     synchronized (operatorMeta) {
@@ -120,7 +118,7 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                                         currentOutputChannelMeta = new ConcurrentHashMap<>();
                                         outputCache.forEach(entry -> {currentOutputChannelMeta.put(entry.getKey(), entry.getValue());});
                                     }
-                                    //update the output queues
+                                    //update the outputQueues
                                     for(String index : currentOutputChannelMeta.keySet()){
                                         String queueKey = currentOutputStreamId + "-" + index;
                                         outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
@@ -142,7 +140,7 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
     public void processElement(Tuple3<Integer, Integer, String> input, ProcessFunction<Tuple3<Integer, Integer, String>, Tuple3<Integer, Integer, String>>.Context context, Collector<Tuple3<Integer, Integer, String>> collector) throws Exception {
         Integer channelIndex = input.f0;
         Integer channelType = input.f1;
-        String word = input.f2;
+        String sentence = input.f2;
         do {
             if(channelType == -1) { //paused job
                 if(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 0) {
@@ -155,46 +153,40 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                     channelType = 1; //switch to IMDG when resumed
                 }
             } else {
-                if (channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) {
+                if(channelIndex != this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()){
                     throw new Exception("Channel index of received tuples does not match this subtask");
                 }
 
-                if (!runningFlag){
-                    System.out.println(getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks() + " is SENDING at " + System.currentTimeMillis());
-                    runningFlag = true;
-                }
-
-//                System.out.printf("[%s] Input: %s, Message: %s\n", getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
-//                        channelType == 1 ? "In-memory": "Built-in",
-//                        word);
-
-                final String atomicKey = word;
-                Long count = counters.computeIfAbsent(word, k -> ignite.atomicLong(atomicKey, 0, true)).incrementAndGet();
-                String msg = word + ":" + count;
-                Integer destChannel = defaultOutputStream.getNextChannelToSendTo(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
-                String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
-                if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
-                    if(outputQueues.containsKey(queueKey)) {
-                        outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, msg));
-                    } else { //switching: raw >> imdg
-                        outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
-                        collector.collect(Tuple3.of(destChannel, 1, msg));
-                    }
-                } else {
-                    if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
-                        outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, msg));
+                String[] words = sentence.toLowerCase().split("\\W+");
+                for (String word : words) {
+                    Integer destChannel = defaultOutputStream.getNextChannelToSendTo(null);
+                    String queueKey = currentOutputStreamId + "-" + destChannel; //<stream_id>-<dest_channel>
+                    if (currentOutputChannelMeta.containsKey(destChannel.toString())) {
+                        if(outputQueues.containsKey(queueKey)) {
+                            outputQueues.get(queueKey).add(Tuple3.of(destChannel, 1, word));
+                        } else { //switching: raw >> imdg
+                            outputQueues.computeIfAbsent(queueKey, k -> ignite.queue(queueKey, 0, ImdgConfig.QUEUE_CONFIG()));
+                            collector.collect(Tuple3.of(destChannel, 1, word));
+                        }
                     } else {
-                        collector.collect(Tuple3.of(destChannel, 0, msg));
+                        if(outputQueues.containsKey(queueKey)) { // switching: imdg >> raw
+                            outputQueues.remove(queueKey).add(Tuple3.of(destChannel, 0, word));
+                        } else {
+                            collector.collect(Tuple3.of(destChannel, 0, word));
+                        }
                     }
                 }
             }
 
-            //check operator status
+            //check operator status. operator can be deactivated if the input and output channels are IMDG
+            //Thus, deactivation make this operator stop listening inputs from IMDG channels
             int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused") && channelType == 1){
+            if(operatorMeta.getOrDefault("instance-status-" + subtaskIndex, "Running").equals("Paused")){
+//                System.out.printf("[%d] %s\n", getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "paused");
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
                 }
+//                System.out.printf("[%d] %s\n", getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "resumed");
             }
 
             //get next tuple
@@ -202,14 +194,14 @@ public class CounterProcessFunctionHybrid extends ProcessFunction<Tuple3<Integer
                 Tuple3<Integer, Integer, String> tuple = inputQueue.take();
                 channelIndex = tuple.f0;
                 channelType = tuple.f1;
-                word = tuple.f2;
+                sentence = tuple.f2;
                 continue;
             } else {
                 if (!inputQueue.isEmpty()) { //process inputs in IMDG if exists
                     Tuple3<Integer, Integer, String> tuple = inputQueue.take();
                     channelIndex = tuple.f0;
                     channelType = tuple.f1;
-                    word = tuple.f2;
+                    sentence = tuple.f2;
                     continue;
                 } else {
 //                    inputQueue.close();
