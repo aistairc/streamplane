@@ -18,7 +18,7 @@
 
 package jp.go.aist.streamplane.examples.wordcountlegacy;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.stream.OutputStream;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.functions.Partitioner;

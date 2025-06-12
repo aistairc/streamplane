@@ -18,7 +18,7 @@
 
 package jp.go.aist.streamplane.examples.wordcount;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.operators.DynamicProcessFunction;
 import jp.go.aist.streamplane.operators.DynamicSinkFunction;
 import jp.go.aist.streamplane.operators.DynamicSourceFunction;
@@ -79,16 +79,17 @@ public class WordCount {
 		final ParameterTool params = ParameterTool.fromArgs(args);
 		final int p = params.getInt("parallelism", env.getParallelism());
 		final boolean pausedJob = params.getBoolean("paused", false);
+		final String customJobId = params.get("customJobId", "wc1");
 
 		//for kafka
 //		final String topic = params.get("topic", "t9");
 //		Properties producerProps = new Properties();
 //		producerProps.put("transaction.timeout.ms", 1000*60*5+"");
 
-		OutputStream sourceOutput = new OutputStream(p, new StreamPlaneRebalancePartitioner());
+		OutputStream sourceOutput = new OutputStream(customJobId + "-source-output", p, new StreamPlaneRebalancePartitioner());
 
 		DataStream<StreamEvent> source = env
-				.addSource(new DynamicSourceFunction<Tuple1<String>>(sourceOutput, pausedJob) {
+				.addSource(new DynamicSourceFunction<Tuple1<String>>(sourceOutput, pausedJob, customJobId) {
 
 					@Override
 					public Tuple1<String> generateNextTuple(Long index) {
@@ -97,22 +98,37 @@ public class WordCount {
                         } catch (InterruptedException e) {
                             throw new RuntimeException(e);
                         }
-                        return Tuple1.of(WordCountData.WORDS[Math.toIntExact(index % WordCountData.WORDS.length)]);
+						String input = WordCountData.WORDS[Math.toIntExact(index % WordCountData.WORDS.length)];
+						if(isDebug()) {
+							System.out.printf("[%s] Message: %s\n",
+									getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+									input);
+						}
+                        return Tuple1.of(input);
 					}
 				})
 				.setParallelism(1)
+				.name("Source")
 				.slotSharingGroup("Non-Migratable");
 
-		OutputStream tokenizerOutput = new OutputStream(p, new StreamPlaneHashPartitioner<String>(), 0);
+		OutputStream tokenizerOutput = new OutputStream(customJobId + "-tokenizer-output", p, new StreamPlaneHashPartitioner<String>(), 0);
 
 		DataStream<StreamEvent> tokenizer = source
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.process(new DynamicProcessFunction<Tuple1<String>, Tuple1<String>>(
 						new InputStream[]{new InputStream(sourceOutput.getId())},
-						tokenizerOutput) {
+						tokenizerOutput,
+						pausedJob,
+						customJobId
+				) {
 
 					@Override
 					public List<Tuple1<String>> processDataTuple(Tuple1<String> input) {
+						if(isDebug()) {
+							System.out.printf("[%s] Message: %s\n",
+									getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+									input.f0);
+						}
 						return Arrays.stream(input.f0.toLowerCase().split("\\W+")).map(word -> Tuple1.of(word)).collect(Collectors.toList());
 					}
 				})
@@ -120,14 +136,16 @@ public class WordCount {
 				.setParallelism(p)
 				.slotSharingGroup("Non-Migratable");
 
-		OutputStream counterOutput = new OutputStream(p, new StreamPlaneForwardPartitioner());
+		OutputStream counterOutput = new OutputStream(customJobId + "-counter-output", p, new StreamPlaneForwardPartitioner());
 
 
 		DataStream<StreamEvent> counter = tokenizer
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.process(new DynamicProcessFunction<Tuple1<String>, Tuple2<String, Long>>(
 						new InputStream[]{new InputStream(tokenizerOutput.getId())},
-						counterOutput
+						counterOutput,
+						pausedJob,
+						customJobId
 				) {
 
 					private final Map<String, IgniteAtomicLong> counters = new ConcurrentHashMap<>(); //state
@@ -135,6 +153,11 @@ public class WordCount {
 					@Override
 					public List<Tuple2<String, Long>> processDataTuple(Tuple1<String> input) {
 						Long count = counters.computeIfAbsent(input.f0, k -> getIgniteClient().atomicLong(input.f0, 0, true)).incrementAndGet();
+						if(isDebug()) {
+							System.out.printf("[%s] Message: %s\n",
+									getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+									input.f0);
+						}
 						return List.of(new Tuple2<>(input.f0, count));
 					}
 
@@ -146,14 +169,18 @@ public class WordCount {
 		DataStreamSink <StreamEvent> sink = counter
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.addSink(new DynamicSinkFunction<Tuple2<String, Long>>(
-						new InputStream[]{new InputStream(counterOutput.getId())}
+						new InputStream[]{new InputStream(counterOutput.getId())},
+						pausedJob,
+						customJobId
 				) {
 
 					@Override
 					public void processDataTuple(Tuple2<String, Long> input) {
-						System.out.printf("[%s] Message: %s\n",
-								getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
-								input.f0 + ": " + input.f1);
+						if(isDebug()) {
+							System.out.printf("[%s] Message: %s\n",
+									getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks(),
+									input.f0 + ": " + input.f1);
+						}
 					}
 				})
 				.name("Sink")
@@ -165,7 +192,7 @@ public class WordCount {
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
 				System.out.println("Job id 1: " + jobId);
-				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+//				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
 
 				//testing: instance-status
 //				try {
@@ -225,34 +252,34 @@ public class WordCount {
 
 
 
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
 //
 //				//testing: migrating operator instance
 //				//example: migrating Counter instance (index: 1)
 //				//1. change input and output channels to IMDG
-				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
-				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
-				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
-				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
+//				IgniteCache<String, String> tokenizerOutputMetaCache = ignite.getOrCreateCache(tokenizerOutput.getId());
+//				tokenizerOutputMetaCache.putIfAbsent("1", tokenizerOutput.getId() + "-1");
+//				IgniteCache<String, String> counterOutputMetaCache = ignite.getOrCreateCache(counterOutput.getId());
+//				counterOutputMetaCache.putIfAbsent("1", counterOutput.getId() + "-1");
 //
 //				//add delay to reflect changes
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
 
 //				//2. Pause old instance
-				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
-				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+//				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+//				counterOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
 
 				//3. Update second job with the following parameters:
-				System.out.println("Tokenizer output id: " + tokenizerOutput.getId());
-				System.out.println("Counter output id: " + counterOutput.getId());
+//				System.out.println("Tokenizer output id: " + tokenizerOutput.getId());
+//				System.out.println("Counter output id: " + counterOutput.getId());
 
 
 			}

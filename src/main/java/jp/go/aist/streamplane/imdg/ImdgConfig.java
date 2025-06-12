@@ -1,6 +1,5 @@
-package jp.go.aist.streamplane;
+package jp.go.aist.streamplane.imdg;
 
-import org.apache.ignite.configuration.AtomicConfiguration;
 import org.apache.ignite.configuration.CollectionConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
 import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;

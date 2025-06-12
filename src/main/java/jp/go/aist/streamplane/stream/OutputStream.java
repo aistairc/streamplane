@@ -14,11 +14,23 @@ public class OutputStream implements Serializable {
     private Integer keyFieldIndex;
 
     public OutputStream(Integer parallelism, Partitioner partitioner) {
-        this(parallelism, partitioner, null);
+        this(null, parallelism, partitioner, null);
+    }
+
+    public OutputStream(String customId, Integer parallelism, Partitioner partitioner) {
+        this(customId, parallelism, partitioner, null);
     }
 
     public OutputStream(Integer parallelism, Partitioner partitioner, Integer keyFieldIndex) {
-        this.id = UUID.randomUUID().toString();
+        this(null, parallelism, partitioner, keyFieldIndex);
+    }
+
+    public OutputStream(String customId, Integer parallelism, Partitioner partitioner, Integer keyFieldIndex) {
+        if (customId == null) {
+            this.id = UUID.randomUUID().toString();
+        } else {
+            this.id = customId;
+        }
         this.parallelism = parallelism;
         this.partitioner = partitioner;
         this.keyFieldIndex = keyFieldIndex;

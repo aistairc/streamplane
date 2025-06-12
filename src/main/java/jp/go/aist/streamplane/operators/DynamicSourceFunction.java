@@ -1,8 +1,7 @@
 package jp.go.aist.streamplane.operators;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.stream.OutputStream;
-import jp.go.aist.streamplane.events.ActivatorEvent;
 import jp.go.aist.streamplane.events.DataTuple;
 import jp.go.aist.streamplane.events.StreamEvent;
 import jp.go.aist.streamplane.stream.partitioners.StreamPlaneForwardPartitioner;
@@ -40,7 +39,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
 
     private Ignite ignite;
 
-    private boolean jobPaused;
+    private boolean paused = false;
 
     private OperatorInstanceInfo operatorInstanceInfo;
 
@@ -48,13 +47,22 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
 
     private IgniteCache<String, Object> states;
 
+    private String jobId = null; //for testing purpose
+
+    private boolean debug = false;
+
     protected DynamicSourceFunction(OutputStream defaultOutputStream) {
-        this(defaultOutputStream, false);
+        this(defaultOutputStream, false, null);
     }
 
-    protected DynamicSourceFunction(OutputStream defaultOutputStream, boolean jobPaused) {
+    protected DynamicSourceFunction(OutputStream defaultOutputStream, boolean paused) {
+        this(defaultOutputStream, paused, null);
+    }
+
+    protected DynamicSourceFunction(OutputStream defaultOutputStream, boolean paused, String customJobId) {
+        this.jobId = customJobId;
         this.defaultOutputStream = defaultOutputStream;
-        this.jobPaused = jobPaused;
+        this.paused = paused;
         this.indexIterator = new AtomicLong(0);
         this.outputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
@@ -72,8 +80,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
     }
 
     public String getStateIdPrefix(){
-        return getRuntimeContext().getJobInfo().getJobId().toString() + "-" +
-                getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
+        return getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
     }
 
     @Override
@@ -84,7 +91,10 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
                 getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
         states = ignite.getOrCreateCache(getStateIdPrefix() + "-state");
-        String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        if(jobId == null){
+            jobId = getRuntimeContext().getJobInfo().getJobId().toString();
+        }
+        String operatorMetaCacheKey = jobId + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
 
@@ -93,7 +103,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
         operatorMetaCache.put("task-name-" + subtaskIndex, getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks());
         operatorMetaCache.put("allocation-id-" + subtaskIndex, getRuntimeContext().getTaskInfo().getAllocationIDAsString());
 
-        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, "Running");
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, paused ? "Paused" : "Running");
         if(instanceStatus != null && instanceStatus.equals("Paused")){
             operatorMeta.put("instance-status-" + subtaskIndex, "Paused");
         } else {
@@ -127,10 +137,20 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
                                 entries.remove(e.getKey());
                             } else {
                                 entries.put(e.getKey(), e.getValue());
-                                if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask()) && e.getValue().equals("Running")){
-                                    synchronized (operatorMeta) {
-                                        operatorMeta.notifyAll();
+                                if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    if(e.getValue().equals("Running")){
+                                        paused = false;
+                                        synchronized (operatorMeta) {
+                                            operatorMeta.notifyAll();
+                                        }
                                     }
+                                    if(e.getValue().equals("Paused")){
+                                        paused = true;
+                                    }
+                                }
+
+                                if(e.getKey().equals("instance-output-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    debug = e.getValue().equals("with-log");
                                 }
 
                                 if(e.getKey().equals("output-stream-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
@@ -168,12 +188,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
 
     @Override
     public void run(SourceContext<StreamEvent> sourceContext) throws Exception {
-        if (jobPaused) {
-            if(getRuntimeContext().getIndexOfThisSubtask() == 0) {
-                for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
-                    sourceContext.collect(new ActivatorEvent(operatorInstanceInfo, i, 0));
-                }
-            }
+        if (paused) {
             synchronized (operatorMeta) {
                 operatorMeta.wait();
             }
@@ -204,7 +219,7 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
                 }
             }
 
-            if(operatorMeta.getOrDefault("instance-status-" + this.getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "Running").equals("Paused")){
+            if(paused){
                 synchronized (operatorMeta) {
                     operatorMeta.wait();
                 }
@@ -222,5 +237,9 @@ public abstract class DynamicSourceFunction<OUT extends Tuple> extends RichSourc
 
     public Ignite getIgniteClient() {
         return ignite;
+    }
+
+    public boolean isDebug() {
+        return debug;
     }
 }

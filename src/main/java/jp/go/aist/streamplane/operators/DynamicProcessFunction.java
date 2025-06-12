@@ -1,6 +1,6 @@
 package jp.go.aist.streamplane.operators;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.stream.InputStream;
 import jp.go.aist.streamplane.stream.OutputStream;
 import jp.go.aist.streamplane.events.ActivatorEvent;
@@ -43,15 +43,31 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
 
     private Ignite ignite;
 
+    private boolean paused = false;
+
     private OperatorInstanceInfo operatorInstanceInfo;
 
     private Collector<StreamEvent> collector;
 
     private IgniteCache<String, Object> states;
 
-    public DynamicProcessFunction(InputStream[] defaultInputStreams, OutputStream defaultOutputStream){
+    private String jobId = null; //for testing purpose
+
+    private boolean debug = false;
+
+    protected DynamicProcessFunction(InputStream[] defaultInputStreams, OutputStream defaultOutputStream){
+        this(defaultInputStreams, defaultOutputStream, false, null);
+    }
+
+    protected DynamicProcessFunction(InputStream[] defaultInputStreams, OutputStream defaultOutputStream, boolean paused){
+        this(defaultInputStreams, defaultOutputStream, paused, null);
+    }
+
+    protected DynamicProcessFunction(InputStream[] defaultInputStreams, OutputStream defaultOutputStream, boolean paused, String customJobId){
+        this.jobId = customJobId;
         this.defaultInputStreams = defaultInputStreams;
         this.defaultOutputStream = defaultOutputStream;
+        this.paused = paused;
         this.outputQueues = new ConcurrentHashMap<>();
         this.inputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
@@ -69,8 +85,7 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
     }
 
     public String getStateIdPrefix(){
-        return getRuntimeContext().getJobInfo().getJobId().toString() + "-" +
-                getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
+        return getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks();
     }
 
     @Override
@@ -81,7 +96,10 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
                 getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
         states = ignite.getOrCreateCache(getStateIdPrefix() + "-state");
-        String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        if(jobId == null){
+            jobId = getRuntimeContext().getJobInfo().getJobId().toString();
+        }
+        String operatorMetaCacheKey = jobId + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
 
@@ -90,7 +108,7 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
         operatorMetaCache.put("task-name-" + subtaskIndex, getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks());
         operatorMetaCache.put("allocation-id-" + subtaskIndex, getRuntimeContext().getTaskInfo().getAllocationIDAsString());
 
-        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, "Running");
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, paused ? "Paused" : "Running");
         if(instanceStatus != null && instanceStatus.equals("Paused")){
             operatorMeta.put("instance-status-" + subtaskIndex, "Paused");
         } else {
@@ -137,10 +155,20 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
 //                                System.out.println("New entry: " + e.getKey() + ": " + e.getValue());
                                 int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
                                 entries.put(e.getKey(), e.getValue());
-                                if(e.getKey().equals("instance-status-" + subtaskIndex) && e.getValue().equals("Running")){
-                                    synchronized (operatorMeta) {
-                                        operatorMeta.notifyAll();
+                                if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    if(e.getValue().equals("Running")){
+                                        paused = false;
+                                        synchronized (operatorMeta) {
+                                            operatorMeta.notifyAll();
+                                        }
                                     }
+                                    if(e.getValue().equals("Paused")){
+                                        paused = true;
+                                    }
+                                }
+
+                                if(e.getKey().equals("instance-output-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    debug = e.getValue().equals("with-log");
                                 }
 
                                 if(e.getKey().equals("input-stream-" + subtaskIndex)){
@@ -196,12 +224,7 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
     public abstract List<OUT> processDataTuple(IN input);
 
     public synchronized void processInputEvent(StreamEvent event) throws Exception {
-        if(event instanceof ActivatorEvent) { //paused job
-            if(getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() == 0) {
-                for (int i = 0; i < defaultOutputStream.getParallelism(); i++) {
-                    collector.collect(new ActivatorEvent(operatorInstanceInfo, i, 0));
-                }
-            }
+        if(paused) { //paused jobx
             synchronized (operatorMeta) {
                 operatorMeta.wait();
                 return;
@@ -244,7 +267,7 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
         }
 
         //check operator status. operator can be deactivated/paused if the input and output channels are IMDG
-        if(operatorMeta.getOrDefault("instance-status-" + getRuntimeContext().getIndexOfThisSubtask(), "Running").equals("Paused")){
+        if(paused){
 //                System.out.printf("[%d] %s\n", getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "paused");
             synchronized (operatorMeta) {
                 operatorMeta.wait();
@@ -265,6 +288,10 @@ public abstract class DynamicProcessFunction<IN extends Tuple, OUT extends Tuple
 
     public InputStream getDefaultInputStreams(int index) {
         return defaultInputStreams[index];
+    }
+
+    public boolean isDebug() {
+        return debug;
     }
 
     private class QueueListenerThread extends Thread {

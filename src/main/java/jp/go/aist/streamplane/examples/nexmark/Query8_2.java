@@ -18,8 +18,8 @@
 
 package jp.go.aist.streamplane.examples.nexmark;
 
-import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.events.StreamEvent;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.operators.DynamicProcessFunction;
 import jp.go.aist.streamplane.operators.DynamicSinkFunction;
 import jp.go.aist.streamplane.operators.DynamicSourceFunction;
@@ -45,11 +45,16 @@ import org.apache.flink.core.execution.JobListener;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.ignite.*;
+import org.apache.ignite.Ignite;
+import org.apache.ignite.IgniteCache;
+import org.apache.ignite.IgniteQueue;
+import org.apache.ignite.Ignition;
 import org.joda.time.DateTime;
 
 import javax.annotation.Nullable;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
 
 /**
  * Skeleton for a Flink DataStream Job.
@@ -63,7 +68,7 @@ import java.util.*;
  * <p>If you change the name of the main class (with the public static void main(String[] args))
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
-public class Query8 {
+public class Query8_2 {
 
 	public static void main(String[] args) throws Exception {
 
@@ -78,7 +83,7 @@ public class Query8 {
 
 		final ParameterTool params = ParameterTool.fromArgs(args);
 		final int p = params.getInt("parallelism", env.getParallelism());
-		final boolean pausedJob = params.getBoolean("paused", false);
+		final boolean pausedJob = params.getBoolean("paused", true);
 
 		//for kafka
 //		final String topic = params.get("topic", "t9");
@@ -292,6 +297,7 @@ public class Query8 {
 							List<Tuple3<Long, String, Long>> result = new ArrayList<>();
 							for(Tuple2<Long, Auction> auctionEvent : auctionSet) {
 								for(Tuple2<Long, Person> personEvent : personSet) {
+									System.out.printf("Auction: %s, Person: %s\n", auctionEvent.f0, personEvent.f0);
 									if(auctionEvent.getField(getDefaultInputStreams(0).getKeyFieldIndex())
 											.equals(personEvent.getField(getDefaultInputStreams(1).getKeyFieldIndex()))) {
 										result.add(Tuple3.of(personEvent.f1.id, personEvent.f1.name, auctionEvent.f1.reserve));
@@ -340,41 +346,27 @@ public class Query8 {
 			@Override
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
-				System.out.println("Job id 1: " + jobId);
+				System.out.println("Job id 2: " + jobId);
 				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
 
 				try {
-					Thread.sleep(20000);
+					Thread.sleep(10000);
 				} catch (InterruptedException e) {
 					throw new RuntimeException(e);
 				}
 
-//				//testing: migrating operator instance
-//				//example: migrating Counter instance (index: 1)
-//				//1. change input and output channels to IMDG
-				IgniteCache<String, String> auctionOutputMetaCache = ignite.getOrCreateCache(auctionSourceOutput.getId());
-				auctionOutputMetaCache.putIfAbsent("1", auctionSourceOutput.getId() + "-1");
-				IgniteCache<String, String> personOutputMetaCache = ignite.getOrCreateCache(personSourceOutput.getId());
-				personOutputMetaCache.putIfAbsent("1", personSourceOutput.getId() + "-1");
-				IgniteCache<String, String> joinedOutputMetaCache = ignite.getOrCreateCache(joinedStreamOutput.getId());
-				joinedOutputMetaCache.putIfAbsent("1", joinedStreamOutput.getId() + "-1");
-
-//				//add delay to reflect changes
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
-
-//				//2. Pause old instance
+				//testing: migrating operator instance in second job
+				//example: migrating Join operator instance (index: 1)
+				//1. change input-stream of Join to IMDG from first job
 				IgniteCache<String, String> joinedOperatorCache = ignite.getOrCreateCache(jobId + "-task-JoinedStream");
-				joinedOperatorCache.put("instance-status-1", "Paused"); //<instance_index>,<status>
+				joinedOperatorCache.put("input-stream-1", "22592603-cd96-4414-acfd-a4d317c7af81,b4f16bc3-584c-4f69-bab8-ef783a7f1154");
 
-				//3. Update second job with the following parameters:
-				System.out.println("AuctionSource output id: " + auctionSourceOutput.getId());
-				System.out.println("PersonSource output id: " + personSourceOutput.getId());
-				System.out.println("JoinedStream output id: " + joinedStreamOutput.getId());
+				//2. change output-stream of Join to first job's Join's output
+				joinedOperatorCache.put("output-stream-1", "744164a2-3659-49b6-9567-0a77a2ffdd0b");
 
+				//3. Resume processing
+				joinedOperatorCache.put("instance-status-1", "Running");
+				
 			}
 
 			@Override

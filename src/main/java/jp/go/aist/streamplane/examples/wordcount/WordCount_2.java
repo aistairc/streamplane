@@ -18,7 +18,7 @@
 
 package jp.go.aist.streamplane.examples.wordcount;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.events.StreamEvent;
 import jp.go.aist.streamplane.operators.DynamicProcessFunction;
 import jp.go.aist.streamplane.operators.DynamicSinkFunction;
@@ -63,7 +63,7 @@ import java.util.stream.Collectors;
  * <p>If you change the name of the main class (with the public static void main(String[] args))
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
-public class WordCount2 {
+public class WordCount_2 {
 
 	public static void main(String[] args) throws Exception {
 
@@ -79,6 +79,7 @@ public class WordCount2 {
 		final ParameterTool params = ParameterTool.fromArgs(args);
 		final int p = params.getInt("parallelism", env.getParallelism());
 		final boolean pausedJob = params.getBoolean("paused", true);
+		final String customJobId = params.get("customJobId", "wc2");
 
 		//for kafka
 //		final String topic = params.get("topic", "t9");
@@ -88,7 +89,7 @@ public class WordCount2 {
 		OutputStream sourceOutput = new OutputStream(p, new StreamPlaneRebalancePartitioner());
 
 		DataStream<StreamEvent> source = env
-				.addSource(new DynamicSourceFunction<Tuple1<String>>(sourceOutput, pausedJob) {
+				.addSource(new DynamicSourceFunction<Tuple1<String>>(sourceOutput, pausedJob, customJobId) {
 
 					@Override
 					public Tuple1<String> generateNextTuple(Long index) {
@@ -101,6 +102,7 @@ public class WordCount2 {
 					}
 				})
 				.setParallelism(1)
+				.name("Source")
 				.slotSharingGroup("Non-Migratable");
 
 		OutputStream tokenizerOutput = new OutputStream(p, new StreamPlaneHashPartitioner<String>(), 0);
@@ -109,7 +111,10 @@ public class WordCount2 {
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.process(new DynamicProcessFunction<Tuple1<String>, Tuple1<String>>(
 						new InputStream[]{new InputStream(sourceOutput.getId())},
-						tokenizerOutput) {
+						tokenizerOutput,
+						pausedJob,
+						customJobId
+				) {
 
 					@Override
 					public List<Tuple1<String>> processDataTuple(Tuple1<String> input) {
@@ -127,7 +132,9 @@ public class WordCount2 {
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.process(new DynamicProcessFunction<Tuple1<String>, Tuple2<String, Long>>(
 						new InputStream[]{new InputStream(tokenizerOutput.getId())},
-						counterOutput
+						counterOutput,
+						pausedJob,
+						customJobId
 				) {
 
 					private final Map<String, IgniteAtomicLong> counters = new ConcurrentHashMap<>(); //state
@@ -146,7 +153,9 @@ public class WordCount2 {
 		DataStreamSink <StreamEvent> sink = counter
 				.partitionCustom(new StreamPlaneDefaultChannelPartitioner(), StreamEvent::getDestinationInstanceIndex)
 				.addSink(new DynamicSinkFunction<Tuple2<String, Long>>(
-						new InputStream[]{new InputStream(counterOutput.getId())}
+						new InputStream[]{new InputStream(counterOutput.getId())},
+						pausedJob,
+						customJobId
 				) {
 
 					@Override
@@ -165,7 +174,7 @@ public class WordCount2 {
 			public void onJobSubmitted(@Nullable JobClient jobClient, @Nullable Throwable throwable) {
 				String jobId = jobClient.getJobID().toString();
 				System.out.println("Job id 2: " + jobId);
-				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
+//				Ignite ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
 
 				//testing: instance-status
 //				try {
@@ -225,25 +234,25 @@ public class WordCount2 {
 
 
 
-				try {
-					Thread.sleep(5000);
-				} catch (InterruptedException e) {
-					throw new RuntimeException(e);
-				}
+//				try {
+//					Thread.sleep(5000);
+//				} catch (InterruptedException e) {
+//					throw new RuntimeException(e);
+//				}
 //
 				//testing: migrating operator instance in second job
 				//example: migrating Counter instance (index: 1)
 				//1. change input-stream of Counter to IMDG from first job
-				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
-//				counterOperatorCache.put("input-stream-1", "<origin_tokenizer_output_stream_id>");
-				counterOperatorCache.put("input-stream-1", "7768efd9-e772-4b91-b937-8f8fe46ff6a4");
+//				IgniteCache<String, String> counterOperatorCache = ignite.getOrCreateCache(jobId + "-task-Counter");
+////				counterOperatorCache.put("input-stream-1", "<origin_tokenizer_output_stream_id>");
+//				counterOperatorCache.put("input-stream-1", "wc1-tokenizer-output");
 
 				//2. change output-stream of Counter to first job's Counter's output
-//				counterOperatorCache.put("output-stream-1", "<origin_counter_output_stream_id>");
-				counterOperatorCache.put("output-stream-1", "6238fac1-9d8f-472b-8ff3-ebac3189671e");
+////				counterOperatorCache.put("output-stream-1", "<origin_counter_output_stream_id>");
+//				counterOperatorCache.put("output-stream-1", "wc1-counter-output");
 
 				//3. Resume processing
-				counterOperatorCache.put("instance-status-1", "Running");
+//				counterOperatorCache.put("instance-status-1", "Running");
 
 			}
 

@@ -1,6 +1,6 @@
 package jp.go.aist.streamplane.operators;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import jp.go.aist.streamplane.events.ActivatorEvent;
 import jp.go.aist.streamplane.events.DataTuple;
 import jp.go.aist.streamplane.events.QueueStopperEvent;
@@ -37,10 +37,26 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
 
     private Ignite ignite;
 
+    private boolean paused = false;
+
     private OperatorInstanceInfo operatorInstanceInfo;
 
-    public DynamicSinkFunction(InputStream[] defaultInputStreams){
+    private String jobId = null; //for testing purpose
+
+    private boolean debug = false;
+
+    protected DynamicSinkFunction(InputStream[] defaultInputStreams){
+        this(defaultInputStreams, false, null);
+    }
+
+    protected DynamicSinkFunction(InputStream[] defaultInputStreams, boolean paused){
+        this(defaultInputStreams, paused, null);
+    }
+
+    protected DynamicSinkFunction(InputStream[] defaultInputStreams, boolean paused, String customJobId){
+        this.jobId = customJobId;
         this.defaultInputStreams = defaultInputStreams;
+        this.paused = paused;
         this.inputQueues = new ConcurrentHashMap<>();
         this.operatorMeta = new ConcurrentHashMap<>();
     }
@@ -52,7 +68,10 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
                 getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
                 getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks());
         ignite = Ignition.getOrStart(ImdgConfig.CONFIG());
-        String operatorMetaCacheKey = getRuntimeContext().getJobInfo().getJobId().toString() + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
+        if(jobId == null){
+            jobId = getRuntimeContext().getJobInfo().getJobId().toString();
+        }
+        String operatorMetaCacheKey = jobId + "-task-" + this.getRuntimeContext().getTaskInfo().getTaskName();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         IgniteCache<String, String> operatorMetaCache = ignite.getOrCreateCache(operatorMetaCacheKey);
 
@@ -61,7 +80,7 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
         operatorMetaCache.put("task-name-" + subtaskIndex, getRuntimeContext().getTaskInfo().getTaskNameWithSubtasks());
         operatorMetaCache.put("allocation-id-" + subtaskIndex, getRuntimeContext().getTaskInfo().getAllocationIDAsString());
 
-        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, "Running");
+        String instanceStatus = operatorMetaCache.getAndPutIfAbsent("instance-status-" + subtaskIndex, paused ? "Paused" : "Running");
         if(instanceStatus != null && instanceStatus.equals("Paused")){
             operatorMeta.put("instance-status-" + subtaskIndex, "Paused");
         } else {
@@ -96,10 +115,20 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
 //                                System.out.println("New entry: " + e.getKey() + ": " + e.getValue());
                                 int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
                                 entries.put(e.getKey(), e.getValue());
-                                if(e.getKey().equals("instance-status-" + subtaskIndex) && e.getValue().equals("Running")){
-                                    synchronized (operatorMeta) {
-                                        operatorMeta.notifyAll();
+                                if(e.getKey().equals("instance-status-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    if(e.getValue().equals("Running")){
+                                        paused = false;
+                                        synchronized (operatorMeta) {
+                                            operatorMeta.notifyAll();
+                                        }
                                     }
+                                    if(e.getValue().equals("Paused")){
+                                        paused = true;
+                                    }
+                                }
+
+                                if(e.getKey().equals("instance-output-" + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask())){
+                                    debug = e.getValue().equals("with-log");
                                 }
 
                                 if(e.getKey().equals("input-stream-" + subtaskIndex)){
@@ -135,7 +164,7 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
     public abstract void processDataTuple(IN input);
 
     public synchronized void processInputEvent(StreamEvent event) throws Exception {
-        if(event instanceof ActivatorEvent) { //paused job
+        if(paused) { //paused job
             synchronized (operatorMeta) {
                 operatorMeta.wait();
                 return;
@@ -153,7 +182,7 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
         }
 
         //check operator status. operator can be deactivated/paused if the input and output channels are IMDG
-        if(operatorMeta.getOrDefault("instance-status-" + getRuntimeContext().getIndexOfThisSubtask(), "Running").equals("Paused")){
+        if(paused){
 //                System.out.printf("[%d] %s\n", getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(), "paused");
             synchronized (operatorMeta) {
                 operatorMeta.wait();
@@ -169,6 +198,10 @@ public abstract class DynamicSinkFunction<IN extends Tuple> extends RichSinkFunc
 
     public Ignite getIgniteClient() {
         return ignite;
+    }
+
+    public boolean isDebug() {
+        return debug;
     }
 
     private class QueueListenerThread extends Thread {

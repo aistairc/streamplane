@@ -1,6 +1,6 @@
 package jp.go.aist.streamplane.examples.wordcountlegacy;
 
-import jp.go.aist.streamplane.ImdgConfig;
+import jp.go.aist.streamplane.imdg.ImdgConfig;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
